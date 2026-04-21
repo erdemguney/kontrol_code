@@ -167,31 +167,93 @@ void pompaSur(int16_t kontrolSinyali) {
 }
 
 // =============================================================================
-// --- FAZ 4: AYRIK ZAMANLI PID MATEMATİĞİ ---
+// --- FAZ 4: AYRIK ZAMANLI PID — Q8.8 FIXED-POINT IMPLEMENTASYONU ---
 // =============================================================================
-float Kp = 2.0;
-float Ki = 0.5;
-float Kd = 1.0;
-float integralToplam = 0.0;
-uint16_t sonGercekSeviye = 0;
-const float dt = 0.1;
+//
+//  NEDEN Q8.8?
+//  ATmega328P'de float = yazılımsal emülasyon = ~14 clock/işlem.
+//  Tam sayı kaydırmaları = 1 clock. Bu mimari FPU maliyetini sıfırlar.
+//
+//  FORMAT: Gerçek değer = Q8_değeri / 256  (256 = 2^8)
+//    Çarpma : a_q8 * b_int → Q8 sonuç (bir >> 8 ile gerçeğe döner)
+//    Toplama: Q8 + Q8      → Q8 sonuç (doğrudan)
+//
+// --- Katsayı Tablosu (Gerçek → Q8) ---
+//   Kp = 2.0  →  2.0 * 256 = 512
+//   Ki = 0.5  →  0.5 * 256 = 128
+//   Kd = 1.0  →  1.0 * 256 = 256
+int16_t Kp_q8 = 512;
+int16_t Ki_q8 = 128;
+int16_t Kd_q8 = 256;
+
+// İntegral biriktirici: Q8 formatında tutulur → int32_t şart (geniş alan)
+// Anti-windup sınırı: ±255 gerçek birim = ±(255 × 256) = ±65280
+int32_t integralToplam_q8 = 0;
+const int32_t INTEGRAL_LIMIT_Q8 = (int32_t)255 * 256; // = 65280
+
+// dt = 0.1 s (Timer1 CTC 10 Hz)
+//   İntegral için : dt_q8  = 0.1 × 256 = 25.6 → 26 (yuvarlama, %0.15 hata)
+//   Türev için    : INV_DT = 1 / 0.1 = 10 (TAM SAYI, kayıpsız)
+const int16_t dt_q8  = 26;
+const uint8_t INV_DT = 10;
+
+uint16_t sonGercekSeviye = 0; // y[k-1]: önceki ölçüm (mm, dipten)
 
 int16_t pidHesapla(uint16_t ref_mm, uint16_t gercek_mm) {
-  float e = (float)ref_mm - (float)gercek_mm;
-  float P = Kp * e;
 
-  integralToplam += Ki * e * dt;
-  if (integralToplam > INTEGRAL_LIMIT)
-    integralToplam = INTEGRAL_LIMIT;
-  else if (integralToplam < -INTEGRAL_LIMIT)
-    integralToplam = -INTEGRAL_LIMIT;
-  float I = integralToplam;
+  // 1. HATA (e) — Q0 (normal tam sayı, mm)
+  int16_t e = (int16_t)ref_mm - (int16_t)gercek_mm;
 
-  // Derivative on Measurement (Referans şokunu engeller)
-  float D = -Kd * ((float)gercek_mm - (float)sonGercekSeviye) / dt;
+  // 2. ORANSAL (P) — Q8 formatında
+  //    P_q8 = Kp_q8 × e
+  //    P    = P_q8 >> 8  ≡  Kp × e
+  //    Overflow: 512 × 1000 = 512000  < INT32_MAX ✓
+  int32_t P_q8 = (int32_t)Kp_q8 * e;
 
-  int16_t u = (int16_t)(P + I + D);
+  // 3. İNTEGRAL (I) — Q8 biriktirilir, Anti-Windup uygulanır
+  //
+  //    dI       = Ki × e × dt
+  //    dI_q8    = (Ki_q8 × e × dt_q8) >> 8
+  //
+  //    Örnek doğrulama: Ki=0.5, e=100mm, dt=0.1
+  //      Beklenen : 0.5 × 100 × 0.1 = 5.0
+  //      Hesaplama: (128 × 100 × 26) >> 8 = 332800 >> 8 = 1300 (Q8)
+  //                 1300 / 256 ≈ 5.08  (%1.5 hata, dt_q8 yuvarlama kaynaklı)
+  //    Overflow: 128 × 1000 × 26 = 3328000 < INT32_MAX ✓
+  integralToplam_q8 += ((int32_t)Ki_q8 * e * dt_q8) >> 8;
+
+  if      (integralToplam_q8 >  INTEGRAL_LIMIT_Q8) integralToplam_q8 =  INTEGRAL_LIMIT_Q8;
+  else if (integralToplam_q8 < -INTEGRAL_LIMIT_Q8) integralToplam_q8 = -INTEGRAL_LIMIT_Q8;
+
+  // 4. TÜREV (D) — Derivative on Measurement, referans şokunu engeller
+  //
+  //    D        = -Kd × (y[k] - y[k-1]) / dt
+  //             = -Kd × delta_y × (1/dt)
+  //             = -Kd × delta_y × INV_DT
+  //
+  //    NEDEN BÖLME YOK?
+  //    dt = 0.1 sabitin tam tersi 1/dt = 10 tam sayıdır.
+  //    Bölme yerine ×10 ile KAYIPSIZ hesaplanır (bölme hatası sıfır).
+  //
+  //    D_q8     = -(Kd_q8 × delta_y × INV_DT)
+  //    D        = D_q8 >> 8  ≡  -Kd × delta_y / dt
+  //
+  //    Örnek doğrulama: Kd=1.0, delta_y=5mm, dt=0.1
+  //      Beklenen : -(1.0 × 5 / 0.1) = -50
+  //      Hesaplama: -(256 × 5 × 10)  = -12800 (Q8)
+  //                 -12800 >> 8      = -50 ✓
+  //    Overflow: 256 × 1000 × 10 = 2560000 < INT32_MAX ✓
+  int16_t delta_y = (int16_t)gercek_mm - (int16_t)sonGercekSeviye;
+  int32_t D_q8    = -(int32_t)Kd_q8 * delta_y * INV_DT;
+
+  // 5. TOPLAM → Q8'den Q0'a dönüşüm (>> 8)
+  //    Tüm terimler Q8 formatında → toplanabilir → tek kaydırmayla tamsayıya
+  int32_t u_q8 = P_q8 + integralToplam_q8 + D_q8;
+  int16_t u    = (int16_t)(u_q8 >> 8);
+
+  // 6. Durum güncelle: y[k] → y[k-1] (bir sonraki türev için)
   sonGercekSeviye = gercek_mm;
+
   return u;
 }
 
@@ -204,14 +266,43 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
     tft.fillScreen(RENK_ARKAPLAN);
     switch (durum) {
     case INIT_CALIBRATION:
-      tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
-      tft.setTextSize(1);
-      tft.setCursor(8, 8);
-      tft.print(F("KALIBRASYON"));
-      tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
-      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-      tft.setCursor(8, 30);
-      tft.print(F("Lutfen bekleyin..."));
+      // ref parametresi bu durumda alt-faz göstergesidur:
+      //   ref == 0  → Bekleme: kullanıcıdan onay bekleniyor
+      //   ref == 1  → Ölçüm: kal. döngüsü çalışıyor
+      // Her iki alt-fazın statik ekranları ayrı çizilir.
+      // (Delta-update burada ref farkıyla tetiklenir)
+      if (ref == 0) {
+        // --- Aşama 1: Kullanıcı uyarısı ---
+        tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN); // Kırmızı – dikkat!
+        tft.setTextSize(1);
+        tft.setCursor(8, 8);
+        tft.print(F("GUVENLi KALiBRASYON"));
+        tft.drawFastHLine(0, 20, tft.width(), RENK_BOSALTIM);
+        tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+        tft.setCursor(8, 30);
+        tft.print(F("KABI TAMAMEN BOSALT!"));
+        tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+        tft.setCursor(8, 50);
+        tft.print(F("Kap bos ise onlayin:"));
+        tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+        tft.setTextSize(2);
+        tft.setCursor(8, 70);
+        tft.print(F("[#] BASLAT"));
+        tft.setTextSize(1);
+      } else {
+        // --- Aşama 2: Ölçüm ekranı ---
+        tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
+        tft.setTextSize(1);
+        tft.setCursor(8, 8);
+        tft.print(F("KALiBRASYON"));
+        tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
+        tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+        tft.setCursor(8, 30);
+        tft.print(F("Olculuyor..."));
+        tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+        tft.setCursor(8, 50);
+        tft.print(F("Lutfen bekleyin."));
+      }
       break;
     case IDLE:
       tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
@@ -379,33 +470,72 @@ void loop() {
   switch (mevcutDurum) {
 
   case INIT_CALIBRATION: {
-    Serial.println(F("[KALIBRASYON] Bos kap olculuyor..."));
+    // =========================================================================
+    // GÜVENLİ KALİBRASYON (Power-Loss Anömali Koruması)
+    // =========================================================================
+    // Sorun: Güç kesilip geldiğinde, kap dolu olabilir.
+    //        Otonom kal. bu durumda suyun yüzeyini "taban" sanacak → felaket.
+    // Çözüm: Kalibrasyon için insan onayı zorunlu kılındı (“Secure Handshake”).
+    //
+    // static bool: Bu bayrak YALNIZCA ilk reset'te başlatılır.
+    // Durum ieinde loop'u n kez döndürmesi gerektiğinden global olması şart;
+    // static anahtar sözcüğü onu stack yerine BSS bölgüsine (global alan)
+    // taşır, 2KB SRAM'dan sadece 1 bit tüketir.
+    static bool onayBekleniyor = true;
+
+    if (onayBekleniyor) {
+      // --- Aşama 1: Kullanıcı 'kap boş' onayı bekle ---
+      // Motorlar kesinlikle durur; # gelene kadar sonsuz döngüde kalır.
+      pompaSur(0);
+
+      // ekranGuncelle: ref=0 → uyarı ekranı
+      ekranGuncelle(INIT_CALIBRATION, 0, 0, 0);
+
+      if (tus == '#') {
+        // Kullanıcı kabın boş olduğunu onayladı.
+        onayBekleniyor = false;
+        // ekranGuncelle'yi zorla güncellemeye itmek için eski_durum’u sıfırla.
+        // (Durum değişmedi fakat alt-faz değişti → farklı statik ekran.)
+        eski_durum = (SistemDurumu)0xFF;
+        Serial.println(F("[KALIBRASYON] Onay alindi. Olcum basliyor..."));
+      }
+      // Onay gelmedi → bu loop turunu bitir, bir sonrakini bekle.
+      break;
+    }
+
+    // --- Aşama 2: Kullanıcı onayladı → Kal. ölçüm döngüsü ---
+    // ekranGuncelle: ref=1 → “Ölçülüyor...” ekranı
+    ekranGuncelle(INIT_CALIBRATION, 1, 0, 0);
+
     uint32_t toplam = 0;
     const uint8_t N = 10;
     for (uint8_t i = 0; i < N; i++) {
-      // Trigger darbesi gönder
       digitalWrite(TRIGGER_PIN, HIGH);
       delayMicroseconds(10);
       digitalWrite(TRIGGER_PIN, LOW);
-      delay(60); // HC-SR04 min. döngü süresi
+      delay(60);
 
       noInterrupts();
       unsigned long yanki = yankiSuresi;
       interrupts();
 
-      // Henüz geçerli echo gelmemişse bu ölçümü atla
+      // Henüz geçerli echo gelmemişse bu ölçümü atla (güvenli başlangıç)
       if (yanki == 0) { i--; delay(10); continue; }
 
       veriyiIsle(yanki);
       toplam += filtrelenmisMesafe_mm;
     }
+
     bosKapMesafe_mm = (uint16_t)(toplam / N);
     const uint16_t SENSOR_KOR_NOKTASI_MM = 20;
     maxSeviye_mm = (bosKapMesafe_mm > SENSOR_KOR_NOKTASI_MM)
-                       ? (bosKapMesafe_mm - SENSOR_KOR_NOKTASI_MM)
-                       : 0;
+                       ? (bosKapMesafe_mm - SENSOR_KOR_NOKTASI_MM) : 0;
+
     Serial.print(F("[KALIBRASYON] Bos kap mesafesi : ")); Serial.print(bosKapMesafe_mm); Serial.println(F(" mm"));
-    Serial.print(F("[KALIBRASYON] Maks su yuksekligi: ")); Serial.print(maxSeviye_mm); Serial.println(F(" mm"));
+    Serial.print(F("[KALIBRASYON] Maks su yuksekligi: ")); Serial.print(maxSeviye_mm);    Serial.println(F(" mm"));
+
+    // Bayrağı sıfırla: bir sonraki reset'te kal. tekrar başlayacak.
+    onayBekleniyor = true;
     mevcutDurum = IDLE;
     break;
   }
@@ -431,7 +561,7 @@ void loop() {
       uint16_t girilen = (uint16_t)atoi(girisBuffer);
       if (girilen > 0 && girilen <= maxSeviye_mm) {
         referans_mm = girilen;
-        integralToplam = 0.0;
+        integralToplam_q8 = 0; // Q8 format sıfırla (windup temizle)
         // sonGercekSeviye: PID türev hesabı için y[k-1] başlatılıyor.
         // Mevcut su yüksekliğine eşitlenir → ilk turda türev şoku sıfır.
         sonGercekSeviye = anlik_su_yuksekligi;
