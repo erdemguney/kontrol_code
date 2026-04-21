@@ -557,12 +557,19 @@ void loop() {
         girisIndeksi++;
         girisBuffer[girisIndeksi] = '\0';
       }
-    } else if (tus == '#') {
+    }
+    // YAMA 1: Geri Silme (Backspace)
+    // 'A' tuşu son karakteri siler. İndeks 0'daysa (buffer boş) işlem yapılmaz.
+    else if (tus == 'A' && girisIndeksi > 0) {
+      girisIndeksi--;
+      girisBuffer[girisIndeksi] = '\0';
+    }
+    else if (tus == '#') {
       uint16_t girilen = (uint16_t)atoi(girisBuffer);
       if (girilen > 0 && girilen <= maxSeviye_mm) {
         referans_mm = girilen;
         integralToplam_q8 = 0; // Q8 format sıfırla (windup temizle)
-        // sonGercekSeviye: PID türev hesabı için y[k-1] başlatılıyor.
+        // sonGercekSeviye: PID türev için y[k-1] başlatılıyor.
         // Mevcut su yüksekliğine eşitlenir → ilk turda türev şoku sıfır.
         sonGercekSeviye = anlik_su_yuksekligi;
         Serial.print(F("[HEDEF] ")); Serial.print(referans_mm); Serial.println(F(" mm"));
@@ -577,8 +584,8 @@ void loop() {
       girisIndeksi = 0;
       mevcutDurum = IDLE;
     }
-    // FIX: Ekranı SADECE hâlâ SET_REFERENCE durumundaysak güncelle.
-    // Geçiş olduysa (AUTO_CONTROL veya IDLE), döngü sonu ekranGuncelle halleder.
+    // Ekranı SADECE hâlâ SET_REFERENCE durumundaysak güncelle.
+    // Geçiş olduysa döngü sonu ekranGuncelle halleder.
     // girisIndeksi ref parametresi olarak geçilir → delta-update tetiklenir.
     if (mevcutDurum == SET_REFERENCE) {
       ekranGuncelle(SET_REFERENCE, girisIndeksi, 0, 0);
@@ -617,14 +624,46 @@ void loop() {
         break;
       }
 
-      // PID hesapla → pompayı sür
+      // YAMA 2 & 3: Güvenlik Kontrolleri (PID sonrası, pompadan önce)
+      //
+      // Bu statik sayıç pid_zamaniGeldi bloğu içindedir:
+      // stack değil BSS'de yaşar, her pid adımında hayatta kalır.
+      static uint8_t stallSayaci = 0;
+
+      // PID hesapla
       int16_t u = pidHesapla(referans_mm, anlik_su_yuksekligi);
+
+      // YAMA 2: Kuru Çalışma Koruması (Dry-Run Protection)
+      // Koşul: Su ≤ 5mm VE PID hala boşaltmaya çalışıyor (u < 0)
+      // Tehlike: Boşaltım pompası havada kuru dönüyor → ısınma → yanma
+      if (anlik_su_yuksekligi <= 5 && u < 0) {
+        Serial.println(F("[E_STOP] Kuru calisma tespiti! Motor yanmasi engellendi."));
+        mevcutDurum = E_STOP;
+        break;
+      }
+
+      // YAMA 3: Tıkanıklık / Boru Kaçağı Tespiti (Stall Detection)
+      // Koşul: Motor tam güe yakın (≥200 PWM) VE su seviyesi hiç değişmedi
+      // Olası sebepler: Pompa tıkandı, boru koptu, valf kapandı
+      // 50 döngü × 100ms = 5 saniye tepkisizlik → E_STOP
+      if (abs(u) > 200 && anlik_su_yuksekligi == sonGercekSeviye) {
+        stallSayaci++;
+        if (stallSayaci >= 50) {
+          Serial.println(F("[E_STOP] Motor tikanikligi veya boru kacagi tespiti!"));
+          mevcutDurum = E_STOP;
+          break;
+        }
+      } else {
+        stallSayaci = 0; // Her şey normalişirse sayıcıyı sıfırla
+      }
+
       aktif_pwm = u;
       pompaSur(u);
 
       Serial.print(F("H:")); Serial.print(referans_mm);
       Serial.print(F(" G:")); Serial.print(anlik_su_yuksekligi);
-      Serial.print(F(" U:")); Serial.println(u);
+      Serial.print(F(" U:")); Serial.print(u);
+      Serial.print(F(" STALL:")); Serial.println(stallSayaci);
     }
 
     if (tus == '*') {
