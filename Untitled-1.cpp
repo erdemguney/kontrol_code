@@ -4,29 +4,29 @@
 // İşlemci: ATmega328P (16 MHz) / 2KB SRAM Optimizasyonlu
 // =============================================================================
 
+#include <Adafruit_GFX.h>    // Grafik temeli (Adafruit)
+#include <Adafruit_ST7735.h> // ST7735S TFT sürücüsü
 #include <Arduino.h>
-#include <SPI.h>                 // ST7735 SPI veriyolu
-#include <Adafruit_GFX.h>        // Grafik temeli (Adafruit)
-#include <Adafruit_ST7735.h>     // ST7735S TFT sürücüsü
-#include <Keypad.h>              // 4x4 matris tuş takımı
-#include <stdlib.h>              // atoi() ve bellek fonksiyonları
+#include <Keypad.h> // 4x4 matris tuş takımı
+#include <SPI.h>    // ST7735 SPI veriyolu
+#include <stdlib.h> // atoi() ve bellek fonksiyonları
 
 // =============================================================================
 // --- DONANIM SABİTLERİ (HAL Katmanı) ---
 // =============================================================================
-#define TRIGGER_PIN          3   // HC-SR04 Trigger → D3
-#define ECHO_PIN             2   // HC-SR04 Echo    → D2 (INT0)
-#define DOLUM_POMPASI_PIN    5   // Dolum Pompası   → D5 (Timer0 PWM)
-#define BOSALTIM_POMPASI_PIN 6   // Boşaltım Pompası→ D6 (Timer0 PWM)
+#define TRIGGER_PIN 3          // HC-SR04 Trigger → D3
+#define ECHO_PIN 2             // HC-SR04 Echo    → D2 (INT0)
+#define DOLUM_POMPASI_PIN 5    // Dolum Pompası   → D5 (Timer0 PWM)
+#define BOSALTIM_POMPASI_PIN 6 // Boşaltım Pompası→ D6 (Timer0 PWM)
 
-#define OLUBANT_ESIGI       40   // Bu PWM'in altında motorlar dönmez
-#define PWM_MAX            255   // analogWrite maksimum sınırı
-#define INTEGRAL_LIMIT   255.0   // Anti-Windup sınırı
+#define OLUBANT_ESIGI 40     // Bu PWM'in altında motorlar dönmez
+#define PWM_MAX 255          // analogWrite maksimum sınırı
+#define INTEGRAL_LIMIT 255.0 // Anti-Windup sınırı
 
 // --- ST7735S TFT SPI Pin Tanımları ---
-#define TFT_CS_PIN  10   
-#define TFT_DC_PIN   9   
-#define TFT_RST_PIN  8   
+#define TFT_CS_PIN 10
+#define TFT_DC_PIN 9
+#define TFT_RST_PIN 8
 
 // --- 4x4 Keypad Pin Tanımları ---
 #define KP_SATIR_SAYISI 4
@@ -42,409 +42,480 @@ const char tusHaritasi[KP_SATIR_SAYISI][KP_SUTUN_SAYISI] = {
     {'1', '2', '3', 'A'},
     {'4', '5', '6', 'B'},
     {'7', '8', '9', 'C'},
-    {'*', '0', '#', 'D'}
-};
+    {'*', '0', '#', 'D'}};
 // Satır: A0, A1, A2, A3 | Sütun: A4, A5, D4, D7
-byte satirPinleri[KP_SATIR_SAYISI] = {A0, A1, A2, A3}; 
-byte sutunPinleri[KP_SUTUN_SAYISI] = {A4, A5,  4,  7}; 
+byte satirPinleri[KP_SATIR_SAYISI] = {A0, A1, A2, A3};
+byte sutunPinleri[KP_SUTUN_SAYISI] = {A4, A5, 4, 7};
 
-Keypad keypad = Keypad(makeKeymap(tusHaritasi), satirPinleri, sutunPinleri, KP_SATIR_SAYISI, KP_SUTUN_SAYISI);
+Keypad keypad = Keypad(makeKeymap(tusHaritasi), satirPinleri, sutunPinleri,
+                       KP_SATIR_SAYISI, KP_SUTUN_SAYISI);
 
 // --- Renk Paleti (RGB565) ---
-#define RENK_ARKAPLAN  0x0000   // Siyah
-#define RENK_YAZI      0xFFFF   // Beyaz
-#define RENK_BASLIK    0x07FF   // Cyan
-#define RENK_ETIKET    0xFFE0   // Sarı
-#define RENK_DEGER     0x07E0   // Yeşil
-#define RENK_DOLUM     0x001F   // Mavi
-#define RENK_BOSALTIM  0xF800   // Kırmızı
+#define RENK_ARKAPLAN 0x0000 // Siyah
+#define RENK_YAZI 0xFFFF     // Beyaz
+#define RENK_BASLIK 0x07FF   // Cyan
+#define RENK_ETIKET 0xFFE0   // Sarı
+#define RENK_DEGER 0x07E0    // Yeşil
+#define RENK_DOLUM 0x001F    // Mavi
+#define RENK_BOSALTIM 0xF800 // Kırmızı
 
 // =============================================================================
 // --- SİSTEM DURUMLARI VE GLOBAL DEĞİŞKENLER ---
 // =============================================================================
 
 enum SistemDurumu {
-    INIT_CALIBRATION, 
-    IDLE,             
-    SET_REFERENCE,    
-    AUTO_CONTROL,     
-    E_STOP            
+  INIT_CALIBRATION,
+  IDLE,
+  SET_REFERENCE,
+  AUTO_CONTROL,
+  E_STOP
 };
 
 volatile SistemDurumu mevcutDurum = INIT_CALIBRATION;
 
-uint16_t referans_mm     = 0; 
-uint16_t bosKapMesafe_mm = 0; 
-uint16_t maxSeviye_mm    = 0; 
-int16_t  aktif_pwm       = 0;  // Ekrana doğru PWM'i basmak için eklendi
+uint16_t referans_mm = 0;
+uint16_t bosKapMesafe_mm = 0;
+uint16_t maxSeviye_mm = 0;
+int16_t aktif_pwm = 0; // Ekrana doğru PWM'i basmak için eklendi
 
 // Dinamik bellek tahsisinden (String) kaçınmak için statik buffer
-char    girisBuffer[5] = {0}; 
-uint8_t girisIndeksi   = 0;   
+char girisBuffer[5] = {0};
+uint8_t girisIndeksi = 0;
 
 // --- Delta-Update Ekran Değişkenleri ---
-SistemDurumu eski_durum           = (SistemDurumu)0xFF;
-uint16_t     eski_referans_mm     = 0xFFFF;
-uint16_t     eski_gercekSeviye_mm = 0xFFFF;
-int16_t      eski_pwm             = 32767;
+SistemDurumu eski_durum = (SistemDurumu)0xFF;
+uint16_t eski_referans_mm = 0xFFFF;
+uint16_t eski_gercekSeviye_mm = 0xFFFF;
+int16_t eski_pwm = 32767;
 
 // =============================================================================
 // --- FAZ 1: KESME TABANLI SENSÖR OKUMA (ISR) ---
 // =============================================================================
 volatile unsigned long yankibaslangicZamani = 0;
-volatile unsigned long yankiSuresi          = 0;
-volatile bool          yeniVeriHazir        = false;
-volatile bool          pid_zamaniGeldi      = false;
+volatile unsigned long yankiSuresi = 0;
+// NOT: pid_zamaniGeldi Timer1 ISR tarafından set edilir;
+// loop() okur ve AUTO_CONTROL içinde sıfırlar.
+volatile bool pid_zamaniGeldi = false;
 
 void echo_ISR() {
-    if (PIND & (1 << PD2)) {  // Yükselen Kenar
-        yankibaslangicZamani = micros();
-    } else {                  // Düşen Kenar
-        yankiSuresi   = micros() - yankibaslangicZamani;
-        yeniVeriHazir = true;
-    }
+  if (PIND & (1 << PD2)) { // Yükselen Kenar: Darbe başlıyor
+    yankibaslangicZamani = micros();
+  } else {                  // Düşen Kenar: Darbe bitti, süreyi hesapla
+    yankiSuresi = micros() - yankibaslangicZamani;
+  }
 }
 
 ISR(TIMER1_COMPA_vect) {
-    if (mevcutDurum == AUTO_CONTROL) {
-        digitalWrite(TRIGGER_PIN, HIGH);
-        delayMicroseconds(10);
-        digitalWrite(TRIGGER_PIN, LOW);
-        pid_zamaniGeldi = true;
-    }
+  if (mevcutDurum == AUTO_CONTROL) {
+    digitalWrite(TRIGGER_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIGGER_PIN, LOW);
+    pid_zamaniGeldi = true;
+  }
 }
 
 // =============================================================================
 // --- FAZ 2: DİJİTAL SİNYAL İŞLEME (DSP) KATMANI ---
 // =============================================================================
-uint16_t sonOlcumler[5]        = {0, 0, 0, 0, 0};
-uint8_t  olcumIndeksi          = 0;
+uint16_t sonOlcumler[5] = {0, 0, 0, 0, 0};
+uint8_t olcumIndeksi = 0;
 uint16_t filtrelenmisMesafe_mm = 0;
 
 void veriyiIsle(unsigned long yanki) {
-    uint16_t anlikMesafe_mm = (uint16_t)((yanki * 10UL) / 58UL); // Float Yasak
-    
-    sonOlcumler[olcumIndeksi] = anlikMesafe_mm;
-    olcumIndeksi = (olcumIndeksi + 1) % 5;
+  uint16_t anlikMesafe_mm = (uint16_t)((yanki * 10UL) / 58UL); // Float Yasak
 
-    uint16_t kopya[5];
-    for (uint8_t i = 0; i < 5; i++) kopya[i] = sonOlcumler[i];
-    
-    for (uint8_t i = 0; i < 4; i++) {
-        for (uint8_t j = 0; j < (4 - i); j++) {
-            if (kopya[j] > kopya[j + 1]) {
-                uint16_t tmp = kopya[j]; kopya[j] = kopya[j+1]; kopya[j+1] = tmp;
-            }
-        }
+  sonOlcumler[olcumIndeksi] = anlikMesafe_mm;
+  olcumIndeksi = (olcumIndeksi + 1) % 5;
+
+  uint16_t kopya[5];
+  for (uint8_t i = 0; i < 5; i++)
+    kopya[i] = sonOlcumler[i];
+
+  for (uint8_t i = 0; i < 4; i++) {
+    for (uint8_t j = 0; j < (4 - i); j++) {
+      if (kopya[j] > kopya[j + 1]) {
+        uint16_t tmp = kopya[j];
+        kopya[j] = kopya[j + 1];
+        kopya[j + 1] = tmp;
+      }
     }
-    uint16_t medyan = kopya[2];
-    filtrelenmisMesafe_mm = (filtrelenmisMesafe_mm * 3 + medyan) / 4;
+  }
+  uint16_t medyan = kopya[2];
+  filtrelenmisMesafe_mm = (filtrelenmisMesafe_mm * 3 + medyan) / 4;
 }
 
 // =============================================================================
 // --- FAZ 3: EYLEYİCİ SÜRÜŞÜ VE GÜVENLİK KİLİTLERİ (HAL) ---
 // =============================================================================
 void pompaSur(int16_t kontrolSinyali) {
-    if (kontrolSinyali > -OLUBANT_ESIGI && kontrolSinyali < OLUBANT_ESIGI) {
-        analogWrite(DOLUM_POMPASI_PIN,    0);
-        analogWrite(BOSALTIM_POMPASI_PIN, 0);
-        return;
-    }
-    
-    int16_t mutlak   = abs(kontrolSinyali);
-    uint8_t pwmDeger = (mutlak > PWM_MAX) ? (uint8_t)PWM_MAX : (uint8_t)mutlak;
+  if (kontrolSinyali > -OLUBANT_ESIGI && kontrolSinyali < OLUBANT_ESIGI) {
+    analogWrite(DOLUM_POMPASI_PIN, 0);
+    analogWrite(BOSALTIM_POMPASI_PIN, 0);
+    return;
+  }
 
-    if (kontrolSinyali > 0) {
-        analogWrite(BOSALTIM_POMPASI_PIN, 0);        
-        analogWrite(DOLUM_POMPASI_PIN,    pwmDeger); 
-    } else {
-        analogWrite(DOLUM_POMPASI_PIN,    0);        
-        analogWrite(BOSALTIM_POMPASI_PIN, pwmDeger); 
-    }
+  int16_t mutlak = abs(kontrolSinyali);
+  uint8_t pwmDeger = (mutlak > PWM_MAX) ? (uint8_t)PWM_MAX : (uint8_t)mutlak;
+
+  if (kontrolSinyali > 0) {
+    analogWrite(BOSALTIM_POMPASI_PIN, 0);
+    analogWrite(DOLUM_POMPASI_PIN, pwmDeger);
+  } else {
+    analogWrite(DOLUM_POMPASI_PIN, 0);
+    analogWrite(BOSALTIM_POMPASI_PIN, pwmDeger);
+  }
 }
 
 // =============================================================================
 // --- FAZ 4: AYRIK ZAMANLI PID MATEMATİĞİ ---
 // =============================================================================
-float    Kp = 2.0;
-float    Ki = 0.5;
-float    Kd = 1.0;
-float    integralToplam  = 0.0;  
-uint16_t sonGercekSeviye = 0;    
-const float dt = 0.1;            
+float Kp = 2.0;
+float Ki = 0.5;
+float Kd = 1.0;
+float integralToplam = 0.0;
+uint16_t sonGercekSeviye = 0;
+const float dt = 0.1;
 
 int16_t pidHesapla(uint16_t ref_mm, uint16_t gercek_mm) {
-    float e = (float)ref_mm - (float)gercek_mm;
-    float P = Kp * e;
-    
-    integralToplam += Ki * e * dt;
-    if      (integralToplam >  INTEGRAL_LIMIT) integralToplam =  INTEGRAL_LIMIT;
-    else if (integralToplam < -INTEGRAL_LIMIT) integralToplam = -INTEGRAL_LIMIT;
-    float I = integralToplam;
-    
-    // Derivative on Measurement (Referans şokunu engeller)
-    float D = -Kd * ((float)gercek_mm - (float)sonGercekSeviye) / dt;
-    
-    int16_t u = (int16_t)(P + I + D);
-    sonGercekSeviye = gercek_mm;
-    return u;
+  float e = (float)ref_mm - (float)gercek_mm;
+  float P = Kp * e;
+
+  integralToplam += Ki * e * dt;
+  if (integralToplam > INTEGRAL_LIMIT)
+    integralToplam = INTEGRAL_LIMIT;
+  else if (integralToplam < -INTEGRAL_LIMIT)
+    integralToplam = -INTEGRAL_LIMIT;
+  float I = integralToplam;
+
+  // Derivative on Measurement (Referans şokunu engeller)
+  float D = -Kd * ((float)gercek_mm - (float)sonGercekSeviye) / dt;
+
+  int16_t u = (int16_t)(P + I + D);
+  sonGercekSeviye = gercek_mm;
+  return u;
 }
 
 // =============================================================================
 // --- FAZ 6: TİTREŞİMSİZ EKRAN GÜNCELLEMESİ (DELTA YÖNTEMİ) ---
 // =============================================================================
-void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek, int16_t pwm) {
-    if (durum != eski_durum) {
-        tft.fillScreen(RENK_ARKAPLAN); 
-        switch (durum) {
-            case INIT_CALIBRATION:
-                tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN); tft.setTextSize(1);
-                tft.setCursor(8, 8);   tft.print(F("KALIBRASYON"));
-                tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
-                tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.setCursor(8, 30);  tft.print(F("Lutfen bekleyin..."));
-                break;
-            case IDLE:
-                tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN); tft.setTextSize(1);
-                tft.setCursor(8, 8);   tft.print(F("SU SEVIYE KONTROL"));
-                tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
-                tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.setCursor(8, 35);  tft.print(F("[*] Seviye Ayarla"));
-                break;
-            case SET_REFERENCE:
-                tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN); tft.setTextSize(1);
-                tft.setCursor(8, 8);   tft.print(F("HEDEF SEVIYE GIR"));
-                tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
-                tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
-                tft.setCursor(8, 30);  tft.print(F("Deger (mm):"));
-                tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.setCursor(8, 85);  tft.print(F("[#] Onayla  [*] Iptal"));
-                break;
-            case AUTO_CONTROL:
-                tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN); tft.setTextSize(1);
-                tft.setCursor(8, 8);   tft.print(F("OTO KONTROL"));
-                tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
-                tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
-                tft.setCursor(8, 30);  tft.print(F("Hedef :"));
-                tft.setCursor(8, 46);  tft.print(F("Gercek:"));
-                tft.setCursor(8, 62);  tft.print(F("Pompa :"));
-                tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.setCursor(8, 100); tft.print(F("[*] Dur"));
-                break;
-            case E_STOP:
-                tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN); tft.setTextSize(2);
-                tft.setCursor(8, 15);  tft.print(F("!!! HATA !!!"));
-                tft.setTextSize(1); tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.setCursor(8, 45);  tft.print(F("Motorlar durduruldu."));
-                tft.setCursor(8, 60);  tft.print(F("RESET gereklidir."));
-                break;
-        }
-        eski_durum = durum;
-        eski_referans_mm     = 0xFFFF;
-        eski_gercekSeviye_mm = 0xFFFF;
-        eski_pwm             = 32767;
+void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
+                   int16_t pwm) {
+  if (durum != eski_durum) {
+    tft.fillScreen(RENK_ARKAPLAN);
+    switch (durum) {
+    case INIT_CALIBRATION:
+      tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(8, 8);
+      tft.print(F("KALIBRASYON"));
+      tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 30);
+      tft.print(F("Lutfen bekleyin..."));
+      break;
+    case IDLE:
+      tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(8, 8);
+      tft.print(F("SU SEVIYE KONTROL"));
+      tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 35);
+      tft.print(F("[*] Seviye Ayarla"));
+      break;
+    case SET_REFERENCE:
+      tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(8, 8);
+      tft.print(F("HEDEF SEVIYE GIR"));
+      tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
+      tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+      tft.setCursor(8, 30);
+      tft.print(F("Deger (mm):"));
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 85);
+      tft.print(F("[#] Onayla  [*] Iptal"));
+      break;
+    case AUTO_CONTROL:
+      tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(8, 8);
+      tft.print(F("OTO KONTROL"));
+      tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
+      tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+      tft.setCursor(8, 30);
+      tft.print(F("Hedef :"));
+      tft.setCursor(8, 46);
+      tft.print(F("Gercek:"));
+      tft.setCursor(8, 62);
+      tft.print(F("Pompa :"));
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 100);
+      tft.print(F("[*] Dur"));
+      break;
+    case E_STOP:
+      tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN);
+      tft.setTextSize(2);
+      tft.setCursor(8, 15);
+      tft.print(F("!!! HATA !!!"));
+      tft.setTextSize(1);
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 45);
+      tft.print(F("Motorlar durduruldu."));
+      tft.setCursor(8, 60);
+      tft.print(F("RESET gereklidir."));
+      break;
     }
+    eski_durum = durum;
+    eski_referans_mm = 0xFFFF;
+    eski_gercekSeviye_mm = 0xFFFF;
+    eski_pwm = 32767;
+  }
 
-    if (durum == SET_REFERENCE) {
-        if (ref != eski_referans_mm) {
-            tft.fillRect(8, 44, 120, 14, RENK_ARKAPLAN);        
-            tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN); tft.setTextSize(1);
-            tft.setCursor(8, 46);
-            if (girisIndeksi == 0) tft.print(F("_"));                              
-            else { tft.print(girisBuffer); tft.print(F(" mm")); }
-            eski_referans_mm = ref;
-        }
+  if (durum == SET_REFERENCE) {
+    if (ref != eski_referans_mm) {
+      tft.fillRect(8, 44, 120, 14, RENK_ARKAPLAN);
+      tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(8, 46);
+      if (girisIndeksi == 0)
+        tft.print(F("_"));
+      else {
+        tft.print(girisBuffer);
+        tft.print(F(" mm"));
+      }
+      eski_referans_mm = ref;
     }
-    else if (durum == AUTO_CONTROL) {
-        if (ref != eski_referans_mm) {
-            tft.fillRect(60, 30, 68, 12, RENK_ARKAPLAN);
-            tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN); tft.setTextSize(1);
-            tft.setCursor(60, 30); tft.print(ref); tft.print(F(" mm"));
-            eski_referans_mm = ref;
-        }
-        if (gercek != eski_gercekSeviye_mm) {
-            tft.fillRect(60, 46, 68, 12, RENK_ARKAPLAN);
-            tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN); tft.setTextSize(1);
-            tft.setCursor(60, 46); tft.print(gercek); tft.print(F(" mm"));
-            eski_gercekSeviye_mm = gercek;
-        }
-        if (pwm != eski_pwm) {
-            tft.fillRect(60, 62, 68, 12, RENK_ARKAPLAN);
-            tft.setTextSize(1); tft.setCursor(60, 62);
-            if (pwm > 0) {
-                tft.setTextColor(RENK_DOLUM, RENK_ARKAPLAN);    
-                tft.print('+'); tft.print(pwm); tft.print(F(" D"));
-            } else if (pwm < 0) {
-                tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN); 
-                tft.print(pwm); tft.print(F(" B"));
-            } else {
-                tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-                tft.print(F("OLUBANT"));
-            }
-            eski_pwm = pwm;
-        }
+  } else if (durum == AUTO_CONTROL) {
+    if (ref != eski_referans_mm) {
+      tft.fillRect(60, 30, 68, 12, RENK_ARKAPLAN);
+      tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(60, 30);
+      tft.print(ref);
+      tft.print(F(" mm"));
+      eski_referans_mm = ref;
     }
+    if (gercek != eski_gercekSeviye_mm) {
+      tft.fillRect(60, 46, 68, 12, RENK_ARKAPLAN);
+      tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(60, 46);
+      tft.print(gercek);
+      tft.print(F(" mm"));
+      eski_gercekSeviye_mm = gercek;
+    }
+    if (pwm != eski_pwm) {
+      tft.fillRect(60, 62, 68, 12, RENK_ARKAPLAN);
+      tft.setTextSize(1);
+      tft.setCursor(60, 62);
+      if (pwm > 0) {
+        tft.setTextColor(RENK_DOLUM, RENK_ARKAPLAN);
+        tft.print('+');
+        tft.print(pwm);
+        tft.print(F(" D"));
+      } else if (pwm < 0) {
+        tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN);
+        tft.print(pwm);
+        tft.print(F(" B"));
+      } else {
+        tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+        tft.print(F("OLUBANT"));
+      }
+      eski_pwm = pwm;
+    }
+  }
 }
 
 // =============================================================================
 // --- KURULUM ---
 // =============================================================================
 void setup() {
-    Serial.begin(9600);
+  Serial.begin(9600);
 
-    pinMode(TRIGGER_PIN,          OUTPUT);
-    pinMode(ECHO_PIN,             INPUT);
-    pinMode(DOLUM_POMPASI_PIN,    OUTPUT);
-    pinMode(BOSALTIM_POMPASI_PIN, OUTPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(DOLUM_POMPASI_PIN, OUTPUT);
+  pinMode(BOSALTIM_POMPASI_PIN, OUTPUT);
 
-    analogWrite(DOLUM_POMPASI_PIN,    0);
-    analogWrite(BOSALTIM_POMPASI_PIN, 0);
+  analogWrite(DOLUM_POMPASI_PIN, 0);
+  analogWrite(BOSALTIM_POMPASI_PIN, 0);
 
-    attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echo_ISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echo_ISR, CHANGE);
 
-    noInterrupts();
-    TCCR1A = 0; TCCR1B = 0; TCNT1  = 0; OCR1A  = 1561;
-    TCCR1B |= (1 << WGM12);               
-    TCCR1B |= (1 << CS12) | (1 << CS10);  
-    TIMSK1 |= (1 << OCIE1A);              
-    interrupts();
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  OCR1A = 1561;
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS12) | (1 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+  interrupts();
 
-    tft.initR(INITR_BLACKTAB);           
-    tft.setRotation(1);                  
-    tft.fillScreen(RENK_ARKAPLAN);
-    tft.setTextWrap(false);              
-    
-    keypad.setDebounceTime(10);
-    ekranGuncelle(INIT_CALIBRATION, 0, 0, 0);
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(RENK_ARKAPLAN);
+  tft.setTextWrap(false);
+
+  keypad.setDebounceTime(10);
+  ekranGuncelle(INIT_CALIBRATION, 0, 0, 0);
 }
 
 // =============================================================================
 // --- ANA DÖNGÜ (STATE MACHINE) ---
 // =============================================================================
 void loop() {
-    char tus = keypad.getKey();
-    if (tus == NO_KEY) tus = 0; 
+  char tus = keypad.getKey();
+  if (tus == NO_KEY)
+    tus = 0;
 
-    // Her Loop Dönüşünde Gerçek Seviye Koordinat Dönüşümü
-    uint16_t anlik_su_yuksekligi = 0;
-    if (filtrelenmisMesafe_mm < bosKapMesafe_mm) {
-        anlik_su_yuksekligi = bosKapMesafe_mm - filtrelenmisMesafe_mm;
+  // Her Loop Dönüşünde Gerçek Seviye Koordinat Dönüşümü
+  uint16_t anlik_su_yuksekligi = 0;
+  if (filtrelenmisMesafe_mm < bosKapMesafe_mm) {
+    anlik_su_yuksekligi = bosKapMesafe_mm - filtrelenmisMesafe_mm;
+  }
+
+  switch (mevcutDurum) {
+
+  case INIT_CALIBRATION: {
+    Serial.println(F("[KALIBRASYON] Bos kap olculuyor..."));
+    uint32_t toplam = 0;
+    const uint8_t N = 10;
+    for (uint8_t i = 0; i < N; i++) {
+      // Trigger darbesi gönder
+      digitalWrite(TRIGGER_PIN, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(TRIGGER_PIN, LOW);
+      delay(60); // HC-SR04 min. döngü süresi
+
+      noInterrupts();
+      unsigned long yanki = yankiSuresi;
+      interrupts();
+
+      // Henüz geçerli echo gelmemişse bu ölçümü atla
+      if (yanki == 0) { i--; delay(10); continue; }
+
+      veriyiIsle(yanki);
+      toplam += filtrelenmisMesafe_mm;
     }
+    bosKapMesafe_mm = (uint16_t)(toplam / N);
+    const uint16_t SENSOR_KOR_NOKTASI_MM = 20;
+    maxSeviye_mm = (bosKapMesafe_mm > SENSOR_KOR_NOKTASI_MM)
+                       ? (bosKapMesafe_mm - SENSOR_KOR_NOKTASI_MM)
+                       : 0;
+    Serial.print(F("[KALIBRASYON] Bos kap mesafesi : ")); Serial.print(bosKapMesafe_mm); Serial.println(F(" mm"));
+    Serial.print(F("[KALIBRASYON] Maks su yuksekligi: ")); Serial.print(maxSeviye_mm); Serial.println(F(" mm"));
+    mevcutDurum = IDLE;
+    break;
+  }
 
-    switch (mevcutDurum) {
+  case IDLE: {
+    pompaSur(0);
+    if (tus == '*') {
+      memset(girisBuffer, 0, sizeof(girisBuffer));
+      girisIndeksi = 0;
+      mevcutDurum = SET_REFERENCE;
+    }
+    break;
+  }
 
-    case INIT_CALIBRATION: {
-        Serial.println(F("Kalibrasyon basliyor..."));
-        uint32_t toplam = 0;
-        const uint8_t N = 10; 
-        for (uint8_t i = 0; i < N; i++) {
-            digitalWrite(TRIGGER_PIN, HIGH);
-            delayMicroseconds(10);
-            digitalWrite(TRIGGER_PIN, LOW);
-            delay(60); 
+  case SET_REFERENCE: {
+    if (tus >= '0' && tus <= '9') {
+      if (girisIndeksi < 4) {
+        girisBuffer[girisIndeksi] = tus;
+        girisIndeksi++;
+        girisBuffer[girisIndeksi] = '\0';
+      }
+    } else if (tus == '#') {
+      uint16_t girilen = (uint16_t)atoi(girisBuffer);
+      if (girilen > 0 && girilen <= maxSeviye_mm) {
+        referans_mm = girilen;
+        integralToplam = 0.0;
+        // sonGercekSeviye: PID türev hesabı için y[k-1] başlatılıyor.
+        // Mevcut su yüksekliğine eşitlenir → ilk turda türev şoku sıfır.
+        sonGercekSeviye = anlik_su_yuksekligi;
+        Serial.print(F("[HEDEF] ")); Serial.print(referans_mm); Serial.println(F(" mm"));
+        mevcutDurum = AUTO_CONTROL;
+      } else {
+        Serial.println(F("[HATA] Gecersiz deger, tekrar girin."));
+        memset(girisBuffer, 0, sizeof(girisBuffer));
+        girisIndeksi = 0;
+      }
+    } else if (tus == '*') {
+      memset(girisBuffer, 0, sizeof(girisBuffer));
+      girisIndeksi = 0;
+      mevcutDurum = IDLE;
+    }
+    // FIX: Ekranı SADECE hâlâ SET_REFERENCE durumundaysak güncelle.
+    // Geçiş olduysa (AUTO_CONTROL veya IDLE), döngü sonu ekranGuncelle halleder.
+    // girisIndeksi ref parametresi olarak geçilir → delta-update tetiklenir.
+    if (mevcutDurum == SET_REFERENCE) {
+      ekranGuncelle(SET_REFERENCE, girisIndeksi, 0, 0);
+    }
+    break;
+  }
 
-            noInterrupts();
-            unsigned long yanki = yankiSuresi;
-            interrupts();
-            
-            veriyiIsle(yanki);
-            toplam += filtrelenmisMesafe_mm;
-        }
-        bosKapMesafe_mm = (uint16_t)(toplam / N);
-        const uint16_t SENSOR_KOR_NOKTASI_MM = 20;
-        maxSeviye_mm = (bosKapMesafe_mm > SENSOR_KOR_NOKTASI_MM) ? (bosKapMesafe_mm - SENSOR_KOR_NOKTASI_MM) : 0;
-        mevcutDurum = IDLE; 
+  case AUTO_CONTROL: {
+    if (pid_zamaniGeldi) {
+      pid_zamaniGeldi = false;
+
+      // Atomik veri kopyası
+      noInterrupts();
+      unsigned long yanki = yankiSuresi;
+      interrupts();
+
+      veriyiIsle(yanki); // filtrelenmisMesafe_mm güncellendi
+
+      // FIX: Taze veri ile koordinat dönüşümü (veriyiIsle SONRASI)
+      // anlik_su_yuksekligi burada güncellenir → E_STOP ve PID taze veri kullanır,
+      // döngü sonu ekranGuncelle de aynı taze veriyi görür.
+      anlik_su_yuksekligi = (filtrelenmisMesafe_mm < bosKapMesafe_mm)
+                            ? (bosKapMesafe_mm - filtrelenmisMesafe_mm) : 0;
+
+      // Güvenlik 1: Sensör yanıt vermiyor (kablo kopması)
+      if (filtrelenmisMesafe_mm == 0) {
+        Serial.println(F("[E_STOP] Sensor yanit vermiyor!"));
+        mevcutDurum = E_STOP;
         break;
-    }
+      }
 
-    case IDLE: {
-        pompaSur(0); 
-        if (tus == '*') {
-            memset(girisBuffer, 0, sizeof(girisBuffer));
-            girisIndeksi = 0;
-            mevcutDurum = SET_REFERENCE;
-        }
+      // Güvenlik 2: Su taşması
+      if (anlik_su_yuksekligi > maxSeviye_mm) {
+        Serial.println(F("[E_STOP] Tasma tespit edildi!"));
+        mevcutDurum = E_STOP;
         break;
+      }
+
+      // PID hesapla → pompayı sür
+      int16_t u = pidHesapla(referans_mm, anlik_su_yuksekligi);
+      aktif_pwm = u;
+      pompaSur(u);
+
+      Serial.print(F("H:")); Serial.print(referans_mm);
+      Serial.print(F(" G:")); Serial.print(anlik_su_yuksekligi);
+      Serial.print(F(" U:")); Serial.println(u);
     }
 
-    case SET_REFERENCE: {
-        if (tus >= '0' && tus <= '9') {
-            if (girisIndeksi < 4) {           
-                girisBuffer[girisIndeksi] = tus;  
-                girisIndeksi++;                   
-                girisBuffer[girisIndeksi] = '\0'; 
-            }
-        }
-        else if (tus == '#') { 
-            uint16_t girilen = (uint16_t)atoi(girisBuffer);
-            if (girilen > 0 && girilen <= maxSeviye_mm) {
-                referans_mm = girilen;
-                integralToplam  = 0.0;
-                sonGercekSeviye = anlik_su_yuksekligi; // Türev şokunu engellemek için mevcut seviyeye eşitle
-                mevcutDurum = AUTO_CONTROL;
-            } else {
-                memset(girisBuffer, 0, sizeof(girisBuffer));
-                girisIndeksi = 0;
-            }
-        }
-        else if (tus == '*') { 
-            memset(girisBuffer, 0, sizeof(girisBuffer));
-            girisIndeksi = 0;
-            mevcutDurum = IDLE;
-        }
-        // Ref parametresi üzerinden ekranı tetiklemek için indeks numarasını yolluyoruz
-        ekranGuncelle(mevcutDurum, girisIndeksi, 0, 0); 
-        break;
+    if (tus == '*') {
+      pompaSur(0);
+      aktif_pwm = 0;
+      mevcutDurum = IDLE;
     }
+    break;
+  }
 
-    case AUTO_CONTROL: {
-        if (pid_zamaniGeldi) {
-            pid_zamaniGeldi = false; 
+  case E_STOP: {
+    analogWrite(DOLUM_POMPASI_PIN, 0);
+    analogWrite(BOSALTIM_POMPASI_PIN, 0);
+    aktif_pwm = 0;
+    break;
+  }
 
-            noInterrupts();
-            unsigned long yanki = yankiSuresi;
-            interrupts();
-            veriyiIsle(yanki);
+  } // Switch Sonu
 
-            if (filtrelenmisMesafe_mm == 0) {
-                mevcutDurum = E_STOP;
-                break;
-            }
-
-            if (anlik_su_yuksekligi > maxSeviye_mm) {
-                mevcutDurum = E_STOP;
-                break;
-            }
-
-            // PID çalışır, global PWM güncellenir
-            int16_t u = pidHesapla(referans_mm, anlik_su_yuksekligi);
-            aktif_pwm = u;
-            pompaSur(u);
-            
-            Serial.print(F("H:")); Serial.print(referans_mm);
-            Serial.print(F(" G:")); Serial.print(anlik_su_yuksekligi);
-            Serial.print(F(" U:")); Serial.println(u);
-        }
-
-        if (tus == '*') {
-            pompaSur(0); 
-            aktif_pwm = 0;
-            mevcutDurum = IDLE;
-        }
-        break;
-    }
-
-    case E_STOP: {
-        analogWrite(DOLUM_POMPASI_PIN,    0);
-        analogWrite(BOSALTIM_POMPASI_PIN, 0);
-        aktif_pwm = 0;
-        break;
-    }
-    
-    } // Switch Sonu
-
-    // Sadece SET_REFERENCE durumunda değilsek normal ekran güncellemesini çağır
-    if (mevcutDurum != SET_REFERENCE) {
-        ekranGuncelle(mevcutDurum, referans_mm, anlik_su_yuksekligi, aktif_pwm);
-    }
+  // Sadece SET_REFERENCE durumunda değilsek normal ekran güncellemesini çağır
+  if (mevcutDurum != SET_REFERENCE) {
+    ekranGuncelle(mevcutDurum, referans_mm, anlik_su_yuksekligi, aktif_pwm);
+  }
 }
