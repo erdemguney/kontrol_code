@@ -64,11 +64,12 @@ Keypad keypad = Keypad(makeKeymap(tusHaritasi), satirPinleri, sutunPinleri,
 // =============================================================================
 
 enum SistemDurumu {
-  INIT_CALIBRATION,
-  IDLE,
-  SET_REFERENCE,
-  AUTO_CONTROL,
-  E_STOP
+  INIT_CALIBRATION, // Açılışta sensor kalibrasyonu
+  IDLE,             // Bekleme
+  SET_REFERENCE,    // Hedef su seviyesi girisi
+  AUTO_CONTROL,     // PID döngüsü aktif
+  TUNE_PID,         // Kp/Ki/Kd katsayılarını keypad'den ayarlama
+  E_STOP            // Acil durdurma
 };
 
 volatile SistemDurumu mevcutDurum = INIT_CALIBRATION;
@@ -87,6 +88,12 @@ SistemDurumu eski_durum = (SistemDurumu)0xFF;
 uint16_t eski_referans_mm = 0xFFFF;
 uint16_t eski_gercekSeviye_mm = 0xFFFF;
 int16_t eski_pwm = 32767;
+
+// --- TUNE_PID: Katsayı Ayar Modu Durumu ---
+// tuneSeciliParam : 0=Kp, 1=Ki, 2=Kd
+// tuneParamSecildi: false = seçim fazı, true = değer girişi fazı
+uint8_t tuneSeciliParam  = 0;
+bool    tuneParamSecildi = false;
 
 // =============================================================================
 // --- FAZ 1: KESME TABANLI SENSÖR OKUMA (ISR) ---
@@ -311,8 +318,8 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
       tft.print(F("SU SEVIYE KONTROL"));
       tft.drawFastHLine(0, 20, tft.width(), RENK_BASLIK);
       tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
-      tft.setCursor(8, 35);
-      tft.print(F("[*] Seviye Ayarla"));
+      tft.setCursor(8, 35); tft.print(F("[*] Seviye Ayarla"));
+      tft.setCursor(8, 50); tft.print(F("[B] PID Ayarla"));
       break;
     case SET_REFERENCE:
       tft.setTextColor(RENK_BASLIK, RENK_ARKAPLAN);
@@ -343,6 +350,32 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
       tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
       tft.setCursor(8, 100);
       tft.print(F("[*] Dur"));
+      break;
+    case TUNE_PID:
+      // -------------------------------------------------------------------
+      // TUNE_PID statik çerçeve:
+      //   Başlık + mevcut Kp/Ki/Kd değerleri + talimatlar
+      //   Katsayı değiştikten sonra eski_durum=0xFF ile yeniden çizilir.
+      //
+      // Q8 → x10 dönüşümü (float yok):
+      //   Kp_q8=512 → (512*10)>>8 = 20 → gösterim "20" (= 2.0)
+      //   Ki_q8=128 → (128*10)>>8 = 5  → gösterim "5"  (= 0.5)
+      // -------------------------------------------------------------------
+      tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN); // Sarı = ayar modu
+      tft.setTextSize(1);
+      tft.setCursor(8, 8);  tft.print(F("PID AYAR MODU"));
+      tft.drawFastHLine(0, 20, tft.width(), RENK_ETIKET);
+      tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+      tft.setCursor(8,  28); tft.print(F("Kp (x10):"));
+      tft.setCursor(8,  40); tft.print(F("Ki (x10):"));
+      tft.setCursor(8,  52); tft.print(F("Kd (x10):"));
+      tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+      tft.setCursor(80, 28); tft.print((uint16_t)(((int32_t)Kp_q8 * 10L) >> 8));
+      tft.setCursor(80, 40); tft.print((uint16_t)(((int32_t)Ki_q8 * 10L) >> 8));
+      tft.setCursor(80, 52); tft.print((uint16_t)(((int32_t)Kd_q8 * 10L) >> 8));
+      tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+      tft.setCursor(8, 66); tft.print(F("[1]Kp [2]Ki [3]Kd"));
+      tft.setCursor(8, 78); tft.print(F("[#]Kaydet [A]Sil [*]Cik"));
       break;
     case E_STOP:
       tft.setTextColor(RENK_BOSALTIM, RENK_ARKAPLAN);
@@ -414,6 +447,36 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
         tft.print(F("OLUBANT"));
       }
       eski_pwm = pwm;
+    }
+  } else if (durum == TUNE_PID) {
+    // Delta-update: seçilen parametre, faz ve giriş uzunluğu değişince güncelle.
+    // Tek bir int16_t'ye encode edilen bileşik durum (eski_pwm bu durumda bunu taşır):
+    //   bit 15-8 : tuneSeciliParam
+    //   bit 7    : tuneParamSecildi
+    //   bit 6-0  : girisIndeksi
+    int16_t tuneState = (int16_t)(((uint16_t)tuneSeciliParam << 8)
+                                 | (tuneParamSecildi ? 0x80 : 0x00)
+                                 | (girisIndeksi & 0x7F));
+    if (tuneState != eski_pwm) {
+      tft.fillRect(8, 90, 152, 26, RENK_ARKAPLAN); // Input alanını temizle
+      tft.setTextSize(1);
+      if (tuneParamSecildi) {
+        // Hangi katsayı seçildiyse adını göster
+        const char* isimler[3] = {"Kp", "Ki", "Kd"};
+        tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
+        tft.setCursor(8, 92);
+        tft.print(isimler[tuneSeciliParam]);
+        tft.print(F(" yeni deger (x10):"));
+        tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
+        tft.setCursor(8, 106);
+        if (girisIndeksi == 0) tft.print(F("_"));
+        else                   tft.print(girisBuffer);
+      } else {
+        tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
+        tft.setCursor(8, 95);
+        tft.print(F("Hangi? [1]Kp [2]Ki [3]Kd"));
+      }
+      eski_pwm = tuneState;
     }
   }
 }
@@ -546,6 +609,13 @@ void loop() {
       memset(girisBuffer, 0, sizeof(girisBuffer));
       girisIndeksi = 0;
       mevcutDurum = SET_REFERENCE;
+    } else if (tus == 'B') {
+      // PID Ayar Moduna geçiş: buffer + durum sıfırla
+      memset(girisBuffer, 0, sizeof(girisBuffer));
+      girisIndeksi     = 0;
+      tuneSeciliParam  = 0;
+      tuneParamSecildi = false;
+      mevcutDurum = TUNE_PID;
     }
     break;
   }
@@ -674,6 +744,69 @@ void loop() {
     break;
   }
 
+  case TUNE_PID: {
+    // =========================================================================
+    // PID KATSAYI AYAR MODU
+    // =========================================================================
+    // Giriş formatı: Değer ×10 olarak girilir.
+    //   Örnek: Kp = 2.5 için "25" yaz, [#] bas.
+    //   Dönüşüm: Q8 = (girilen_x10 × 256) / 10
+    //
+    // Aşama 1 (tuneParamSecildi=false): Hangi katsayı düzenlenecek?
+    //   [1] Kp | [2] Ki | [3] Kd | [*] İptal → IDLE
+    //
+    // Aşama 2 (tuneParamSecildi=true): Değer girişi
+    //   [0-9] Rakam | [A] Geri sil | [#] Onayla | [*] İptal → Aşama 1
+
+    if (!tuneParamSecildi) {
+      // --- Aşama 1: Katsayı seçimi ---
+      if      (tus == '1') { tuneSeciliParam = 0; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
+      else if (tus == '2') { tuneSeciliParam = 1; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
+      else if (tus == '3') { tuneSeciliParam = 2; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
+      else if (tus == '*') { mevcutDurum = IDLE; }
+    } else {
+      // --- Aşama 2: Değer girişi ---
+      if (tus >= '0' && tus <= '9') {
+        if (girisIndeksi < 4) {
+          girisBuffer[girisIndeksi++] = tus;
+          girisBuffer[girisIndeksi]   = '\0';
+        }
+      } else if (tus == 'A' && girisIndeksi > 0) {
+        girisBuffer[--girisIndeksi] = '\0';
+      } else if (tus == '#') {
+        uint16_t girilen_x10 = (uint16_t)atoi(girisBuffer);
+        if (girilen_x10 > 0 && girilen_x10 <= 5000) { // 0.1 – 500.0 aralığı
+          // Q8 dönüşümü: Q8 = (x10 × 256) / 10
+          int16_t yeniQ8 = (int16_t)((int32_t)girilen_x10 * 256L / 10L);
+          if      (tuneSeciliParam == 0) { Kp_q8 = yeniQ8;                   Serial.print(F("[TUNE] Kp=")); }
+          else if (tuneSeciliParam == 1) { Ki_q8 = yeniQ8; integralToplam_q8 = 0; Serial.print(F("[TUNE] Ki=")); }
+          else                           { Kd_q8 = yeniQ8;                   Serial.print(F("[TUNE] Kd=")); }
+          Serial.print(girilen_x10 / 10); Serial.print('.'); Serial.println(girilen_x10 % 10);
+          // Ekranı zorla güncelle: yeni değer statik çerçevede görünsün
+          eski_durum = (SistemDurumu)0xFF;
+          tuneParamSecildi = false;
+          memset(girisBuffer, 0, 5);
+          girisIndeksi = 0;
+        } else {
+          Serial.println(F("[TUNE] Gecersiz deger. 1-5000 arasi girin."));
+          memset(girisBuffer, 0, 5);
+          girisIndeksi = 0;
+        }
+      } else if (tus == '*') {
+        // Aşama 2'den Aşama 1'e dön
+        tuneParamSecildi = false;
+        memset(girisBuffer, 0, 5);
+        girisIndeksi = 0;
+        eski_durum = (SistemDurumu)0xFF; // Hangi? mesajı yeniden çiz
+      }
+    }
+    // TUNE_PID kendi ekranını yönetir (döngü sonu çağrısından hariç)
+    if (mevcutDurum == TUNE_PID) {
+      ekranGuncelle(TUNE_PID, girisIndeksi, tuneSeciliParam, (int16_t)tuneParamSecildi);
+    }
+    break;
+  }
+
   case E_STOP: {
     analogWrite(DOLUM_POMPASI_PIN, 0);
     analogWrite(BOSALTIM_POMPASI_PIN, 0);
@@ -684,7 +817,7 @@ void loop() {
   } // Switch Sonu
 
   // Sadece SET_REFERENCE durumunda değilsek normal ekran güncellemesini çağır
-  if (mevcutDurum != SET_REFERENCE) {
+  if (mevcutDurum != SET_REFERENCE && mevcutDurum != TUNE_PID) {
     ekranGuncelle(mevcutDurum, referans_mm, anlik_su_yuksekligi, aktif_pwm);
   }
 }
