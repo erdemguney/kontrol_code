@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <Keypad.h> // 4x4 matris tuş takımı
 #include <SPI.h>    // ST7735 SPI veriyolu
+#include <avr/wdt.h> // Hardware Watchdog Timer
 #include <stdlib.h> // atoi() ve bellek fonksiyonları
 
 // =============================================================================
@@ -80,7 +81,8 @@ uint16_t maxSeviye_mm = 0;
 int16_t aktif_pwm = 0; // Ekrana doğru PWM'i basmak için eklendi
 
 // Dinamik bellek tahsisinden (String) kaçınmak için statik buffer
-char girisBuffer[5] = {0};
+// Boyut 7: "10C50" gibi 5 karakter + ondalik + null = 7 byte
+char girisBuffer[7] = {0};
 uint8_t girisIndeksi = 0;
 
 // --- Delta-Update Ekran Değişkenleri ---
@@ -100,8 +102,10 @@ bool    tuneParamSecildi = false;
 // =============================================================================
 volatile unsigned long yankibaslangicZamani = 0;
 volatile unsigned long yankiSuresi = 0;
-// NOT: pid_zamaniGeldi Timer1 ISR tarafından set edilir;
-// loop() okur ve AUTO_CONTROL içinde sıfırlar.
+// trigger_zamani_geldi: Timer1 ISR'ı sadece bu bayrağı set eder (ISR kısa tutulur).
+// loop() bayrağı görünce DPM ile 10µs darbe gönderir → Blind-spot engellendi.
+volatile bool trigger_zamani_geldi = false;
+// pid_zamaniGeldi: loop() içinde trigger gönderildikten sonra set edilir.
 volatile bool pid_zamaniGeldi = false;
 
 void echo_ISR() {
@@ -113,11 +117,10 @@ void echo_ISR() {
 }
 
 ISR(TIMER1_COMPA_vect) {
-  if (mevcutDurum == AUTO_CONTROL) {
-    digitalWrite(TRIGGER_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIGGER_PIN, LOW);
-    pid_zamaniGeldi = true;
+  // ISR YALNIZCA bayrak set eder — delayMicroseconds veya digitalWrite YASAK.
+  // DPM trigger ve pid_zamaniGeldi → loop() içinde işlenir.
+  if (mevcutDurum == AUTO_CONTROL || mevcutDurum == INIT_CALIBRATION) {
+    trigger_zamani_geldi = true;
   }
 }
 
@@ -262,6 +265,52 @@ int16_t pidHesapla(uint16_t ref_mm, uint16_t gercek_mm) {
   sonGercekSeviye = gercek_mm;
 
   return u;
+}
+
+// =============================================================================
+// --- parseQ8: Float-Free Ondalik Dizgeden Q8.8 Dönüştürücü ---
+// =============================================================================
+// Giriş: "2C5" gibi bir dizi ('C' = ondalik nokta)
+// Çıkış: Q8.8 formatında int16_t
+//
+// Algoritma (float yasak):
+//   Q8 = (tamKisim × 256) + (ondalikKisim × 256) / ondalikCarpan
+//
+// Dogrulama:
+//   "2C5"   → (2×256) + (5×256)/10    = 512 + 128 = 640   = 2.5   × 256 ✓
+//   "10C50" → (10×256) + (50×256)/100  = 2560 + 128 = 2688 = 10.5  × 256 ✓
+//   "2"     → (2×256) + 0              = 512             = 2.0   × 256 ✓
+//   "C5"    → 0       + (5×256)/10    = 128             = 0.5   × 256 ✓
+//
+// Kesinşlik: Ondalik kisim tam bölünmediğinde tamsayı truncation olur.
+//   "1C3"  → 256 + (3×256)/10 = 256 + 76 = 332   (gercek 332.8, hata %0.24)
+// Bu hata PID kalibrasyonu için kabul edilebilir.
+int16_t parseQ8(const char* buf) {
+  int32_t tamKisim      = 0;
+  int32_t ondalikKisim  = 0;
+  int32_t ondalikCarpan = 1;
+  bool    ondalikMod    = false;
+
+  for (uint8_t i = 0; buf[i] != '\0'; i++) {
+    char c = buf[i];
+    if (c == 'C') {
+      // 'C' = ondalik nokta; ikinci 'C' görmezden gelinir (güvenlik)
+      ondalikMod = true;
+    } else if (c >= '0' && c <= '9') {
+      if (!ondalikMod) {
+        // Tam kisim: basamak ekle
+        tamKisim = tamKisim * 10 + (c - '0');
+      } else {
+        // Ondalik kisim: basamak ekle ve carpanı on katla
+        ondalikKisim  = ondalikKisim * 10 + (c - '0');
+        ondalikCarpan = ondalikCarpan * 10;
+      }
+    }
+  }
+
+  // Q8 = (tamKisim × 256) + (ondalikKisim × 256) / ondalikCarpan
+  // Overflow kontrol: tamKisim ≤ 999, 999×256 = 255744 < INT32_MAX ✓
+  return (int16_t)((tamKisim * 256L) + ((ondalikKisim * 256L) / ondalikCarpan));
 }
 
 // =============================================================================
@@ -469,8 +518,14 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
         tft.print(F(" yeni deger (x10):"));
         tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
         tft.setCursor(8, 106);
-        if (girisIndeksi == 0) tft.print(F("_"));
-        else                   tft.print(girisBuffer);
+        if (girisIndeksi == 0) {
+          tft.print(F("_"));
+        } else {
+          // 'C' karakterini ekranda '.' olarak göster (görsel manipulasyon)
+          for (uint8_t i = 0; i < girisIndeksi; i++) {
+            tft.print(girisBuffer[i] == 'C' ? '.' : girisBuffer[i]);
+          }
+        }
       } else {
         tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
         tft.setCursor(8, 95);
@@ -485,9 +540,12 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
 // --- KURULUM ---
 // =============================================================================
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200); // Telemetri darboğazı açıldı: 9600 → 115200 baud
 
-  pinMode(TRIGGER_PIN, OUTPUT);
+  // TRIGGER pini: DPM — pinMode'den ~8x hızlı, ISR uyumlu
+  DDRD  |= (1 << DDD3);  // D3 → çıkış
+  PORTD &= ~(1 << PD3);  // D3 → LOW (başlangıç)
+
   pinMode(ECHO_PIN, INPUT);
   pinMode(DOLUM_POMPASI_PIN, OUTPUT);
   pinMode(BOSALTIM_POMPASI_PIN, OUTPUT);
@@ -514,12 +572,29 @@ void setup() {
 
   keypad.setDebounceTime(10);
   ekranGuncelle(INIT_CALIBRATION, 0, 0, 0);
+
+  wdt_enable(WDTO_500MS); // Watchdog aktif: 500ms içinde wdt_reset() gelmezse → donanımsal reset
 }
 
 // =============================================================================
 // --- ANA DÖNGÜ (STATE MACHINE) ---
 // =============================================================================
 void loop() {
+  wdt_reset(); // Watchdog beslendi — sistem hayatta, loop donmuyor
+
+  // Asenkron DPM Tetikleyici (Blind-spot Çözümü)
+  // ISR sadece bayrak set eder; darbe DPM ile loop() içinde gönderilir.
+  // Bu sayede ISR içinde yasak olan delayMicroseconds() ortadan kalktı.
+  if (trigger_zamani_geldi) {
+    trigger_zamani_geldi = false;
+    PORTD |= (1 << PD3);    // HIGH — DPM: 2 clock cycle
+    delayMicroseconds(10);  // HC-SR04 zorunlu 10µs darbe genişliği
+    PORTD &= ~(1 << PD3);   // LOW
+    if (mevcutDurum == AUTO_CONTROL) {
+      pid_zamaniGeldi = true; // PID döngüsünü tetikle
+    }
+  }
+
   char tus = keypad.getKey();
   if (tus == NO_KEY)
     tus = 0;
@@ -694,13 +769,13 @@ void loop() {
         break;
       }
 
-      // YAMA 2 & 3: Güvenlik Kontrolleri (PID sonrası, pompadan önce)
-      //
-      // Bu statik sayıç pid_zamaniGeldi bloğu içindedir:
-      // stack değil BSS'de yaşar, her pid adımında hayatta kalır.
       static uint8_t stallSayaci = 0;
 
-      // PID hesapla
+      // STALL BUG FIX: pidHesapla() sonunda sonGercekSeviye = gercek_mm yapar.
+      // PID'den SONRA kontrol edilirse sonGercekSeviye == anlik_su_yuksekligi
+      // her zaman eşit → stall ASLA tetiklenmez (kalıcı false negative).
+      // Çözüm: y[k-1] değerini PID çağrısından ÖNCE kaydet.
+      uint16_t oncekiSeviye = sonGercekSeviye;
       int16_t u = pidHesapla(referans_mm, anlik_su_yuksekligi);
 
       // YAMA 2: Kuru Çalışma Koruması (Dry-Run Protection)
@@ -712,11 +787,10 @@ void loop() {
         break;
       }
 
-      // YAMA 3: Tıkanıklık / Boru Kaçağı Tespiti (Stall Detection)
-      // Koşul: Motor tam güe yakın (≥200 PWM) VE su seviyesi hiç değişmedi
-      // Olası sebepler: Pompa tıkandı, boru koptu, valf kapandı
+      // YAMA 3: Tıkanıklık / Boru Kaçağı Tespiti (Stall Detection — BUG FİX)
+      // oncekiSeviye: PID'den önceki y[k-1] değeri → karşılaştırma artık doğru
       // 50 döngü × 100ms = 5 saniye tepkisizlik → E_STOP
-      if (abs(u) > 200 && anlik_su_yuksekligi == sonGercekSeviye) {
+      if (abs(u) > 200 && anlik_su_yuksekligi == oncekiSeviye) {
         stallSayaci++;
         if (stallSayaci >= 50) {
           Serial.println(F("[E_STOP] Motor tikanikligi veya boru kacagi tespiti!"));
@@ -724,7 +798,7 @@ void loop() {
           break;
         }
       } else {
-        stallSayaci = 0; // Her şey normalişirse sayıcıyı sıfırla
+        stallSayaci = 0;
       }
 
       aktif_pwm = u;
@@ -746,61 +820,68 @@ void loop() {
 
   case TUNE_PID: {
     // =========================================================================
-    // PID KATSAYI AYAR MODU
+    // PID KATSAYI AYAR MODU — parseQ8 ile Float-Free Ondalik Giriş
     // =========================================================================
-    // Giriş formatı: Değer ×10 olarak girilir.
-    //   Örnek: Kp = 2.5 için "25" yaz, [#] bas.
-    //   Dönüşüm: Q8 = (girilen_x10 × 256) / 10
+    // Giriş formatı: Gerçek değer doğrudan, ondalik nokta için [C] tuşu.
+    //   Örnek: Kp = 2.5 için [2][C][5][#] tuşlarına bas.
+    //   Örnek: Ki = 0.5 için [C][5][#] veya [0][C][5][#]
+    //   Ekranda 'C' karakteri '.' olarak görünür.
     //
-    // Aşama 1 (tuneParamSecildi=false): Hangi katsayı düzenlenecek?
-    //   [1] Kp | [2] Ki | [3] Kd | [*] İptal → IDLE
-    //
-    // Aşama 2 (tuneParamSecildi=true): Değer girişi
-    //   [0-9] Rakam | [A] Geri sil | [#] Onayla | [*] İptal → Aşama 1
+    // Buffer limiti: 6 karakter ("10C50" + null = 7 byte)
+    // Tek 'C' kuralı: buffer'da zaten 'C' varsa ikinci 'C' tuşu reddedilir.
 
     if (!tuneParamSecildi) {
       // --- Aşama 1: Katsayı seçimi ---
-      if      (tus == '1') { tuneSeciliParam = 0; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
-      else if (tus == '2') { tuneSeciliParam = 1; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
-      else if (tus == '3') { tuneSeciliParam = 2; tuneParamSecildi = true; memset(girisBuffer,0,5); girisIndeksi = 0; }
+      if      (tus == '1') { tuneSeciliParam = 0; tuneParamSecildi = true; memset(girisBuffer,0,7); girisIndeksi = 0; }
+      else if (tus == '2') { tuneSeciliParam = 1; tuneParamSecildi = true; memset(girisBuffer,0,7); girisIndeksi = 0; }
+      else if (tus == '3') { tuneSeciliParam = 2; tuneParamSecildi = true; memset(girisBuffer,0,7); girisIndeksi = 0; }
       else if (tus == '*') { mevcutDurum = IDLE; }
     } else {
       // --- Aşama 2: Değer girişi ---
       if (tus >= '0' && tus <= '9') {
-        if (girisIndeksi < 4) {
+        if (girisIndeksi < 6) {
           girisBuffer[girisIndeksi++] = tus;
+          girisBuffer[girisIndeksi]   = '\0';
+        }
+      } else if (tus == 'C') {
+        // Ondalik nokta: buffer'da henüz 'C' yoksa ekle
+        // Kontrol: strchr yerine elle tara (Arduino kütüphane bağımsızlığı)
+        bool cVarMi = false;
+        for (uint8_t i = 0; i < girisIndeksi; i++) { if (girisBuffer[i] == 'C') { cVarMi = true; break; } }
+        if (!cVarMi && girisIndeksi < 6) {
+          girisBuffer[girisIndeksi++] = 'C';
           girisBuffer[girisIndeksi]   = '\0';
         }
       } else if (tus == 'A' && girisIndeksi > 0) {
         girisBuffer[--girisIndeksi] = '\0';
       } else if (tus == '#') {
-        uint16_t girilen_x10 = (uint16_t)atoi(girisBuffer);
-        if (girilen_x10 > 0 && girilen_x10 <= 5000) { // 0.1 – 500.0 aralığı
-          // Q8 dönüşümü: Q8 = (x10 × 256) / 10
-          int16_t yeniQ8 = (int16_t)((int32_t)girilen_x10 * 256L / 10L);
-          if      (tuneSeciliParam == 0) { Kp_q8 = yeniQ8;                   Serial.print(F("[TUNE] Kp=")); }
+        // parseQ8: 'C' ondalik noktası içeren dizgiyi Q8.8'e çevir
+        int16_t yeniQ8 = parseQ8(girisBuffer);
+        if (yeniQ8 > 0) { // Sıfır veya negatif geçersiz
+          if      (tuneSeciliParam == 0) { Kp_q8 = yeniQ8;                       Serial.print(F("[TUNE] Kp=")); }
           else if (tuneSeciliParam == 1) { Ki_q8 = yeniQ8; integralToplam_q8 = 0; Serial.print(F("[TUNE] Ki=")); }
-          else                           { Kd_q8 = yeniQ8;                   Serial.print(F("[TUNE] Kd=")); }
-          Serial.print(girilen_x10 / 10); Serial.print('.'); Serial.println(girilen_x10 % 10);
-          // Ekranı zorla güncelle: yeni değer statik çerçevede görünsün
-          eski_durum = (SistemDurumu)0xFF;
+          else                           { Kd_q8 = yeniQ8;                       Serial.print(F("[TUNE] Kd=")); }
+          // Serial çıktısı: Q8'den geri gerçeğe (tam ve ondalik) — float yok
+          Serial.print(yeniQ8 >> 8);              // Tam kisim
+          Serial.print('.');
+          Serial.println(((yeniQ8 & 0xFF) * 10) >> 8); // Ondalik kisim (1 hane)
+          eski_durum = (SistemDurumu)0xFF; // Ekrani zorla yenile
           tuneParamSecildi = false;
-          memset(girisBuffer, 0, 5);
+          memset(girisBuffer, 0, 7);
           girisIndeksi = 0;
         } else {
-          Serial.println(F("[TUNE] Gecersiz deger. 1-5000 arasi girin."));
-          memset(girisBuffer, 0, 5);
+          Serial.println(F("[TUNE] Gecersiz deger."));
+          memset(girisBuffer, 0, 7);
           girisIndeksi = 0;
         }
       } else if (tus == '*') {
         // Aşama 2'den Aşama 1'e dön
         tuneParamSecildi = false;
-        memset(girisBuffer, 0, 5);
+        memset(girisBuffer, 0, 7);
         girisIndeksi = 0;
-        eski_durum = (SistemDurumu)0xFF; // Hangi? mesajı yeniden çiz
+        eski_durum = (SistemDurumu)0xFF;
       }
     }
-    // TUNE_PID kendi ekranını yönetir (döngü sonu çağrısından hariç)
     if (mevcutDurum == TUNE_PID) {
       ekranGuncelle(TUNE_PID, girisIndeksi, tuneSeciliParam, (int16_t)tuneParamSecildi);
     }
