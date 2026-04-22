@@ -7,6 +7,7 @@
 #include <Adafruit_GFX.h>    // Grafik temeli (Adafruit)
 #include <Adafruit_ST7735.h> // ST7735S TFT sürücüsü
 #include <Arduino.h>
+#include <EEPROM.h>  // PID katsayılarını kalıcı bellekte saklamak için
 #include <Keypad.h>  // 4x4 matris tuş takımı
 #include <SPI.h>     // ST7735 SPI veriyolu
 #include <avr/wdt.h> // Hardware Watchdog Timer
@@ -67,16 +68,20 @@ Keypad keypad = Keypad(makeKeymap(tusHaritasi), satirPinleri, sutunPinleri,
 // --- SİSTEM DURUMLARI VE GLOBAL DEĞİŞKENLER ---
 // =============================================================================
 
-enum SistemDurumu {
-  INIT_CALIBRATION, // Açılışta sensor kalibrasyonu
-  IDLE,             // Bekleme
-  SET_REFERENCE,    // Hedef su seviyesi girisi
-  AUTO_CONTROL,     // PID döngüsü aktif
-  TUNE_PID,         // Kp/Ki/Kd katsayılarını keypad'den ayarlama
-  E_STOP            // Acil durdurma
-};
+// --- ATOMIK DURUM YONETIMI ---
+// AVR GCC enum'u 16-bit (2 byte) olarak derler. 8-bit CPU'da 2-byte
+// okuma/yazma atomik degildir -> ISR araya girerse "Torn Read/Write" olur
+// ve durum makinesi tanimsiz bir state'e ziplar.
+// Cozum: uint8_t (1 byte) = donanimsal atomik okuma/yazma garantisi.
+typedef uint8_t SistemDurumu;
+const uint8_t INIT_CALIBRATION = 0;
+const uint8_t IDLE = 1;
+const uint8_t SET_REFERENCE = 2;
+const uint8_t AUTO_CONTROL = 3;
+const uint8_t TUNE_PID = 4;
+const uint8_t E_STOP = 5;
 
-volatile SistemDurumu mevcutDurum = INIT_CALIBRATION;
+volatile uint8_t mevcutDurum = INIT_CALIBRATION;
 
 uint16_t referans_mm = 0;
 uint16_t bosKapMesafe_mm = 0;
@@ -217,6 +222,60 @@ void pompaSur(int16_t kontrolSinyali) {
 int16_t Kp_q8 = 512;
 int16_t Ki_q8 = 128;
 int16_t Kd_q8 = 256;
+
+// --- EEPROM Kalıcı Depolama ---
+// ATmega328P EEPROM: 1024 byte, ~100.000 yazma ömrü.
+// EEPROM.update() sadece değer DEĞİŞMİŞSE yazar → wear-leveling.
+//
+// Bellek Haritası:
+//   Adres 0     : Magic byte (0xA5 = geçerli veri var)
+//   Adres 1-2   : Kp_q8 (int16_t = 2 byte)
+//   Adres 3-4   : Ki_q8 (int16_t = 2 byte)
+//   Adres 5-6   : Kd_q8 (int16_t = 2 byte)
+//   Toplam      : 7 byte (1024'den 7 = %0.7)
+#define EEPROM_MAGIC_ADDR 0
+#define EEPROM_KP_ADDR 1
+#define EEPROM_KI_ADDR 3
+#define EEPROM_KD_ADDR 5
+#define EEPROM_MAGIC_VAL 0xA5
+
+// EEPROM'a 3 katsayıyı kaydet (TUNE_PID onay anında çağrılır)
+void eepromKatsayilariKaydet() {
+  EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VAL);
+  EEPROM.update(EEPROM_KP_ADDR, (uint8_t)(Kp_q8 & 0xFF));
+  EEPROM.update(EEPROM_KP_ADDR + 1, (uint8_t)(Kp_q8 >> 8));
+  EEPROM.update(EEPROM_KI_ADDR, (uint8_t)(Ki_q8 & 0xFF));
+  EEPROM.update(EEPROM_KI_ADDR + 1, (uint8_t)(Ki_q8 >> 8));
+  EEPROM.update(EEPROM_KD_ADDR, (uint8_t)(Kd_q8 & 0xFF));
+  EEPROM.update(EEPROM_KD_ADDR + 1, (uint8_t)(Kd_q8 >> 8));
+}
+
+// EEPROM'dan katsayıları yükle (setup() içinde çağrılır)
+// Magic byte geçersizse → fabrika varsayılanları korunur.
+void eepromKatsayilariYukle() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) {
+    Serial.println(F("[EEPROM] Gecerli veri yok, varsayilan katsayilar."));
+    return; // İlk kullanım veya EEPROM temizlenmiş → default Kp/Ki/Kd kalır
+  }
+  Kp_q8 = (int16_t)(EEPROM.read(EEPROM_KP_ADDR) |
+                    (EEPROM.read(EEPROM_KP_ADDR + 1) << 8));
+  Ki_q8 = (int16_t)(EEPROM.read(EEPROM_KI_ADDR) |
+                    (EEPROM.read(EEPROM_KI_ADDR + 1) << 8));
+  Kd_q8 = (int16_t)(EEPROM.read(EEPROM_KD_ADDR) |
+                    (EEPROM.read(EEPROM_KD_ADDR + 1) << 8));
+  Serial.print(F("[EEPROM] Yuklendi: Kp="));
+  Serial.print(Kp_q8 >> 8);
+  Serial.print('.');
+  Serial.print(((Kp_q8 & 0xFF) * 10) >> 8);
+  Serial.print(F(" Ki="));
+  Serial.print(Ki_q8 >> 8);
+  Serial.print('.');
+  Serial.print(((Ki_q8 & 0xFF) * 10) >> 8);
+  Serial.print(F(" Kd="));
+  Serial.print(Kd_q8 >> 8);
+  Serial.print('.');
+  Serial.println(((Kd_q8 & 0xFF) * 10) >> 8);
+}
 
 // İntegral biriktirici: Q8 formatında tutulur → int32_t şart (geniş alan)
 // Anti-windup sınırı: ±255 gerçek birim = ±(255 × 256) = ±65280
@@ -623,6 +682,10 @@ void setup() {
   tft.setTextWrap(false);
 
   keypad.setDebounceTime(10);
+
+  // EEPROM'dan kayıtlı PID katsayılarını yükle (varsa)
+  eepromKatsayilariYukle();
+
   ekranGuncelle(INIT_CALIBRATION, 0, 0, 0);
 
   wdt_enable(WDTO_500MS); // Watchdog aktif: 500ms içinde wdt_reset() gelmezse →
@@ -980,7 +1043,8 @@ void loop() {
           Serial.print(yeniQ8 >> 8); // Tam kisim
           Serial.print('.');
           Serial.println(((yeniQ8 & 0xFF) * 10) >> 8); // Ondalik kisim (1 hane)
-          eski_durum = (SistemDurumu)0xFF;             // Ekrani zorla yenile
+          eepromKatsayilariKaydet(); // EEPROM'a kalıcı yaz (update = wear-safe)
+          eski_durum = (SistemDurumu)0xFF; // Ekrani zorla yenile
           tuneParamSecildi = false;
           memset(girisBuffer, 0, 7);
           girisIndeksi = 0;
