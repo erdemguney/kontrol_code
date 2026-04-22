@@ -22,7 +22,9 @@
 
 #define OLUBANT_ESIGI 40     // Bu PWM'in altında motorlar dönmez
 #define PWM_MAX 255          // analogWrite maksimum sınırı
-#define INTEGRAL_LIMIT 255.0 // Anti-Windup sınırı
+// NOT: Eski float INTEGRAL_LIMIT kaldırıldı. Tek kaynak: INTEGRAL_LIMIT_Q8 (FAZ 4)
+#define STALL_TOLERANCE 3    // mm — stall deadband (sensör jitterını emer)
+#define SENSOR_TIMEOUT_MS 500 // ms — echo ISR bu süredir gelmediyse → E_STOP
 
 // --- ST7735S TFT SPI Pin Tanımları ---
 #define TFT_CS_PIN 10
@@ -108,11 +110,16 @@ volatile bool trigger_zamani_geldi = false;
 // pid_zamaniGeldi: loop() içinde trigger gönderildikten sonra set edilir.
 volatile bool pid_zamaniGeldi = false;
 
+// Sensor Heartbeat: Her geçerli echo darbesi bu zaman damgasını günceller.
+// loop() içinde millis() - sonEchoZamani > SENSOR_TIMEOUT_MS → kablo koptu!
+volatile unsigned long sonEchoZamani = 0;
+
 void echo_ISR() {
   if (PIND & (1 << PD2)) { // Yükselen Kenar: Darbe başlıyor
     yankibaslangicZamani = micros();
   } else {                  // Düşen Kenar: Darbe bitti, süreyi hesapla
     yankiSuresi = micros() - yankibaslangicZamani;
+    sonEchoZamani = millis(); // Heartbeat: sensör hayatta
   }
 }
 
@@ -157,22 +164,35 @@ void veriyiIsle(unsigned long yanki) {
 // =============================================================================
 // --- FAZ 3: EYLEYİCİ SÜRÜŞÜ VE GÜVENLİK KİLİTLERİ (HAL) ---
 // =============================================================================
+// Shadow Register: Gerçek PWM değeri sadece DEĞİŞTİĞİNDE donanıma yazılır.
+// Lüzumsuz analogWrite() çağrıları Timer0 interrupt yükünü ortadan kaldırır.
+static uint8_t shadow_dolum   = 0;
+static uint8_t shadow_bosaltim = 0;
+
 void pompaSur(int16_t kontrolSinyali) {
+  uint8_t yeniDolum   = 0;
+  uint8_t yeniBosaltim = 0;
+
   if (kontrolSinyali > -OLUBANT_ESIGI && kontrolSinyali < OLUBANT_ESIGI) {
-    analogWrite(DOLUM_POMPASI_PIN, 0);
-    analogWrite(BOSALTIM_POMPASI_PIN, 0);
-    return;
+    // Ölü bant: her iki pompa kapalı
+  } else {
+    int16_t mutlak = abs(kontrolSinyali);
+    uint8_t pwmDeger = (mutlak > PWM_MAX) ? (uint8_t)PWM_MAX : (uint8_t)mutlak;
+    if (kontrolSinyali > 0) {
+      yeniDolum = pwmDeger;
+    } else {
+      yeniBosaltim = pwmDeger;
+    }
   }
 
-  int16_t mutlak = abs(kontrolSinyali);
-  uint8_t pwmDeger = (mutlak > PWM_MAX) ? (uint8_t)PWM_MAX : (uint8_t)mutlak;
-
-  if (kontrolSinyali > 0) {
-    analogWrite(BOSALTIM_POMPASI_PIN, 0);
-    analogWrite(DOLUM_POMPASI_PIN, pwmDeger);
-  } else {
-    analogWrite(DOLUM_POMPASI_PIN, 0);
-    analogWrite(BOSALTIM_POMPASI_PIN, pwmDeger);
+  // Sadece değişen kanalı donanıma yaz (Shadow Register Pattern)
+  if (yeniDolum != shadow_dolum) {
+    analogWrite(DOLUM_POMPASI_PIN, yeniDolum);
+    shadow_dolum = yeniDolum;
+  }
+  if (yeniBosaltim != shadow_bosaltim) {
+    analogWrite(BOSALTIM_POMPASI_PIN, yeniBosaltim);
+    shadow_bosaltim = yeniBosaltim;
   }
 }
 
@@ -309,8 +329,15 @@ int16_t parseQ8(const char* buf) {
   }
 
   // Q8 = (tamKisim × 256) + (ondalikKisim × 256) / ondalikCarpan
-  // Overflow kontrol: tamKisim ≤ 999, 999×256 = 255744 < INT32_MAX ✓
-  return (int16_t)((tamKisim * 256L) + ((ondalikKisim * 256L) / ondalikCarpan));
+  int32_t sonuc = (tamKisim * 256L) + ((ondalikKisim * 256L) / ondalikCarpan);
+
+  // OVERFLOW KORUMASI: int16_t max = 32767 → 127.99 gerçek değer.
+  // Kullanıcı 128+ girerse Q8 negatife taşar → PID ters çalışır = felaket.
+  // Kelepce: 32512 = 127.0 × 256 (üst sınır, güvenli)
+  if (sonuc > 32512) sonuc = 32512;
+  if (sonuc < 0)     sonuc = 0;  // Negatif katsayı anlamsız
+
+  return (int16_t)sonuc;
 }
 
 // =============================================================================
@@ -403,25 +430,26 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
     case TUNE_PID:
       // -------------------------------------------------------------------
       // TUNE_PID statik çerçeve:
-      //   Başlık + mevcut Kp/Ki/Kd değerleri + talimatlar
+      //   Başlık + mevcut Kp/Ki/Kd değerleri (ondalık) + talimatlar
       //   Katsayı değiştikten sonra eski_durum=0xFF ile yeniden çizilir.
       //
-      // Q8 → x10 dönüşümü (float yok):
-      //   Kp_q8=512 → (512*10)>>8 = 20 → gösterim "20" (= 2.0)
-      //   Ki_q8=128 → (128*10)>>8 = 5  → gösterim "5"  (= 0.5)
+      // Q8 → ondalık gösterim (float yok):
+      //   Kp_q8=640 → 640>>8=2, ((128*10)>>8)=5 → ekranda "2.5"
+      //   Ki_q8=128 → 128>>8=0, ((128*10)>>8)=5 → ekranda "0.5"
       // -------------------------------------------------------------------
       tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN); // Sarı = ayar modu
       tft.setTextSize(1);
       tft.setCursor(8, 8);  tft.print(F("PID AYAR MODU"));
       tft.drawFastHLine(0, 20, tft.width(), RENK_ETIKET);
       tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
-      tft.setCursor(8,  28); tft.print(F("Kp (x10):"));
-      tft.setCursor(8,  40); tft.print(F("Ki (x10):"));
-      tft.setCursor(8,  52); tft.print(F("Kd (x10):"));
+      tft.setCursor(8,  28); tft.print(F("Kp:"));
+      tft.setCursor(8,  40); tft.print(F("Ki:"));
+      tft.setCursor(8,  52); tft.print(F("Kd:"));
       tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
-      tft.setCursor(80, 28); tft.print((uint16_t)(((int32_t)Kp_q8 * 10L) >> 8));
-      tft.setCursor(80, 40); tft.print((uint16_t)(((int32_t)Ki_q8 * 10L) >> 8));
-      tft.setCursor(80, 52); tft.print((uint16_t)(((int32_t)Kd_q8 * 10L) >> 8));
+      // Q8 → ondalık gösterim (float yok): tamKisim.ondalikKisim
+      tft.setCursor(80, 28); tft.print(Kp_q8 >> 8); tft.print('.'); tft.print(((Kp_q8 & 0xFF) * 10) >> 8);
+      tft.setCursor(80, 40); tft.print(Ki_q8 >> 8); tft.print('.'); tft.print(((Ki_q8 & 0xFF) * 10) >> 8);
+      tft.setCursor(80, 52); tft.print(Kd_q8 >> 8); tft.print('.'); tft.print(((Kd_q8 & 0xFF) * 10) >> 8);
       tft.setTextColor(RENK_YAZI, RENK_ARKAPLAN);
       tft.setCursor(8, 66); tft.print(F("[1]Kp [2]Ki [3]Kd"));
       tft.setCursor(8, 78); tft.print(F("[#]Kaydet [A]Sil [*]Cik"));
@@ -515,7 +543,7 @@ void ekranGuncelle(SistemDurumu durum, uint16_t ref, uint16_t gercek,
         tft.setTextColor(RENK_ETIKET, RENK_ARKAPLAN);
         tft.setCursor(8, 92);
         tft.print(isimler[tuneSeciliParam]);
-        tft.print(F(" yeni deger (x10):"));
+        tft.print(F(" yeni deger:"));
         tft.setTextColor(RENK_DEGER, RENK_ARKAPLAN);
         tft.setCursor(8, 106);
         if (girisIndeksi == 0) {
@@ -648,17 +676,32 @@ void loop() {
     uint32_t toplam = 0;
     const uint8_t N = 10;
     for (uint8_t i = 0; i < N; i++) {
-      digitalWrite(TRIGGER_PIN, HIGH);
-      delayMicroseconds(10);
-      digitalWrite(TRIGGER_PIN, LOW);
-      delay(60);
+      wdt_reset(); // WDT KORUMASI: 10×60ms = 600ms > 500ms WDT → bu olmadan BOOTLOOP!
+
+      // DPM Trigger: digitalWrite'den ~8x hızlı
+      PORTD |= (1 << PD3);    // HIGH (2 clock cycle)
+      delayMicroseconds(10);  // HC-SR04 zorunlu 10µs
+      PORTD &= ~(1 << PD3);   // LOW
+      delay(60);              // HC-SR04 min. döngü süresi
 
       noInterrupts();
       unsigned long yanki = yankiSuresi;
       interrupts();
 
       // Henüz geçerli echo gelmemişse bu ölçümü atla (güvenli başlangıç)
-      if (yanki == 0) { i--; delay(10); continue; }
+      // KORUMA: Sensör hiç yanıt vermezse sonsuz döngü riski vardı.
+      // wdt_reset() WDT'yi beslediği için watchdog tetiklenmezdi → sistem donar.
+      // Retry limiti: 20 deneme × 10ms = 200ms sonra E_STOP.
+      if (yanki == 0) {
+        static uint8_t echoRetry = 0;
+        if (++echoRetry > 20) {
+          Serial.println(F("[E_STOP] Kalibrasyon: sensor yanit vermiyor!"));
+          mevcutDurum = E_STOP;
+          echoRetry = 0;
+          break;
+        }
+        i--; wdt_reset(); delay(10); continue;
+      }
 
       veriyiIsle(yanki);
       toplam += filtrelenmisMesafe_mm;
@@ -755,14 +798,21 @@ void loop() {
       anlik_su_yuksekligi = (filtrelenmisMesafe_mm < bosKapMesafe_mm)
                             ? (bosKapMesafe_mm - filtrelenmisMesafe_mm) : 0;
 
-      // Güvenlik 1: Sensör yanıt vermiyor (kablo kopması)
-      if (filtrelenmisMesafe_mm == 0) {
-        Serial.println(F("[E_STOP] Sensor yanit vermiyor!"));
+      // GÜVENLİK 1: Sensör Heartbeat Timeout
+      // echo_ISR her geçerli düşen kenarda sonEchoZamani'ni günceller.
+      // Bu zaman damgası SENSOR_TIMEOUT_MS'dir duruyorsa → kablo koptu/sensör öldü.
+      // filtrelenmisMesafe_mm == 0 kontrolü YETERSİZ: IIR filtre eski değeri tutar!
+      // NOT: sonEchoZamani 4 byte = non-atomic, atomik kopyalama şart.
+      noInterrupts();
+      unsigned long echoKopya = sonEchoZamani;
+      interrupts();
+      if (millis() - echoKopya > SENSOR_TIMEOUT_MS) {
+        Serial.println(F("[E_STOP] Sensor heartbeat timeout! Kablo koptu?"));
         mevcutDurum = E_STOP;
         break;
       }
 
-      // Güvenlik 2: Su taşması
+      // GÜVENLİK 2: Su taşması
       if (anlik_su_yuksekligi > maxSeviye_mm) {
         Serial.println(F("[E_STOP] Tasma tespit edildi!"));
         mevcutDurum = E_STOP;
@@ -771,29 +821,25 @@ void loop() {
 
       static uint8_t stallSayaci = 0;
 
-      // STALL BUG FIX: pidHesapla() sonunda sonGercekSeviye = gercek_mm yapar.
-      // PID'den SONRA kontrol edilirse sonGercekSeviye == anlik_su_yuksekligi
-      // her zaman eşit → stall ASLA tetiklenmez (kalıcı false negative).
-      // Çözüm: y[k-1] değerini PID çağrısından ÖNCE kaydet.
+      // y[k-1] değerini PID çağrısından ÖNCE kaydet (PID içinde üzerine yazar)
       uint16_t oncekiSeviye = sonGercekSeviye;
       int16_t u = pidHesapla(referans_mm, anlik_su_yuksekligi);
 
-      // YAMA 2: Kuru Çalışma Koruması (Dry-Run Protection)
-      // Koşul: Su ≤ 5mm VE PID hala boşaltmaya çalışıyor (u < 0)
-      // Tehlike: Boşaltım pompası havada kuru dönüyor → ısınma → yanma
+      // GÜVENLİK 3: Kuru Çalışma Koruması (Dry-Run Protection)
       if (anlik_su_yuksekligi <= 5 && u < 0) {
-        Serial.println(F("[E_STOP] Kuru calisma tespiti! Motor yanmasi engellendi."));
+        Serial.println(F("[E_STOP] Kuru calisma tespiti!"));
         mevcutDurum = E_STOP;
         break;
       }
 
-      // YAMA 3: Tıkanıklık / Boru Kaçağı Tespiti (Stall Detection — BUG FİX)
-      // oncekiSeviye: PID'den önceki y[k-1] değeri → karşılaştırma artık doğru
-      // 50 döngü × 100ms = 5 saniye tepkisizlik → E_STOP
-      if (abs(u) > 200 && anlik_su_yuksekligi == oncekiSeviye) {
+      // GÜVENLİK 4: Tıkanıklık Tespiti (Stall Detection + Jitter Tolerance)
+      // ESKİ: anlik == onceki → sensör jitterı (1-2mm) sürekli sıfırlar
+      // YENİ: abs(anlik - onceki) < STALL_TOLERANCE → dalga titremesini emer
+      int16_t seviyeDelta = (int16_t)anlik_su_yuksekligi - (int16_t)oncekiSeviye;
+      if (abs(u) > 200 && abs(seviyeDelta) < STALL_TOLERANCE) {
         stallSayaci++;
-        if (stallSayaci >= 50) {
-          Serial.println(F("[E_STOP] Motor tikanikligi veya boru kacagi tespiti!"));
+        if (stallSayaci >= 50) { // 50 × 100ms = 5 saniye
+          Serial.println(F("[E_STOP] Stall tespiti!"));
           mevcutDurum = E_STOP;
           break;
         }
@@ -891,6 +937,8 @@ void loop() {
   case E_STOP: {
     analogWrite(DOLUM_POMPASI_PIN, 0);
     analogWrite(BOSALTIM_POMPASI_PIN, 0);
+    shadow_dolum = 0;     // Shadow register tutarlılığı
+    shadow_bosaltim = 0;
     aktif_pwm = 0;
     break;
   }
